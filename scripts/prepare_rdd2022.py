@@ -227,6 +227,9 @@ def parse_voc_annotation(xml_path: Path, image_index: ImageIndex) -> ParsedAnnot
     if unsupported_found and not supported_found:
         return ParsedAnnotation(ParseOutcome.UNSUPPORTED)
 
+    if supported_found and not label_lines:
+        return ParsedAnnotation(ParseOutcome.SKIPPED)
+
     if not supported_found:
         return ParsedAnnotation(
             ParseOutcome.NEGATIVE,

@@ -105,6 +105,70 @@ def test_parse_voc_annotation_keeps_empty_negative_sample(tmp_path: Path) -> Non
     assert parsed.record.label_lines == []
 
 
+def test_parse_voc_annotation_skips_supported_class_with_invalid_bbox(tmp_path: Path) -> None:
+    image_path = tmp_path / "invalid_bbox.jpg"
+    image_path.write_bytes(b"invalid-bbox-image")
+    xml_path = tmp_path / "invalid_bbox.xml"
+    write_voc_xml(
+        xml_path,
+        filename="invalid_bbox.jpg",
+        width=100,
+        height=100,
+        objects=[("D40", (80, 80, 60, 60))],
+    )
+
+    parsed = parse_voc_annotation(xml_path, build_image_index(tmp_path))
+    assert parsed.outcome is ParseOutcome.SKIPPED
+    assert parsed.record is None
+
+
+def test_parse_voc_annotation_skips_supported_class_with_missing_bndbox(tmp_path: Path) -> None:
+    image_path = tmp_path / "missing_bbox.jpg"
+    image_path.write_bytes(b"missing-bbox-image")
+    xml_path = tmp_path / "missing_bbox.xml"
+    xml_path.write_text(
+        "\n".join(
+            [
+                "<annotation>",
+                "  <filename>missing_bbox.jpg</filename>",
+                "  <size>",
+                "    <width>100</width>",
+                "    <height>100</height>",
+                "  </size>",
+                "  <object>",
+                "    <name>D40</name>",
+                "  </object>",
+                "</annotation>",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    parsed = parse_voc_annotation(xml_path, build_image_index(tmp_path))
+    assert parsed.outcome is ParseOutcome.SKIPPED
+    assert parsed.record is None
+
+
+def test_parse_voc_annotation_keeps_valid_box_from_mixed_supported_objects(tmp_path: Path) -> None:
+    image_path = tmp_path / "mixed.jpg"
+    image_path.write_bytes(b"mixed-image")
+    xml_path = tmp_path / "mixed.xml"
+    write_voc_xml(
+        xml_path,
+        filename="mixed.jpg",
+        width=100,
+        height=100,
+        objects=[("D40", (80, 80, 60, 60)), ("D00", (10, 10, 40, 40))],
+    )
+
+    parsed = parse_voc_annotation(xml_path, build_image_index(tmp_path))
+    assert parsed.outcome is ParseOutcome.POSITIVE
+    assert parsed.record is not None
+    assert len(parsed.record.label_lines) == 1
+    assert parsed.record.class_counts["longitudinal_crack"] == 1
+
+
 def test_parse_voc_annotation_skips_unsupported_only_sample(tmp_path: Path) -> None:
     image_path = tmp_path / "unsupported.jpg"
     image_path.write_bytes(b"unsupported-image")
