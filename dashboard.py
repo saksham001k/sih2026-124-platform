@@ -517,7 +517,7 @@ def render_road_hazard_section(
             st.dataframe(
                 filtered_events[display_columns],
                 hide_index=True,
-                use_container_width=True,
+                width="stretch",
             )
         annotated_path = artifacts_dir / "annotated.mp4"
         if annotated_path.is_file():
@@ -534,13 +534,13 @@ def render_road_hazard_section(
             with left:
                 frame_path = resolve_evidence(event.get("evidence_frame"), artifacts_dir)
                 if frame_path:
-                    st.image(str(frame_path), caption="Context frame", use_container_width=True)
+                    st.image(str(frame_path), caption="Context frame", width="stretch")
                 else:
                     st.info("Context image was not generated for this event.")
             with right:
                 crop_path = resolve_evidence(event.get("evidence_crop"), artifacts_dir)
                 if crop_path:
-                    st.image(str(crop_path), caption="Detection crop", use_container_width=True)
+                    st.image(str(crop_path), caption="Detection crop", width="stretch")
                 st.subheader(str(event["class"]).title())
                 st.write(f"Confidence: **{float(event['confidence']):.2f}**")
                 st.write(f"Video time: **{float(event['video_time_s']):.2f} s**")
@@ -660,7 +660,7 @@ def render_traffic_section(artifacts_dir: Path) -> None:
     if bottlenecks.empty:
         st.info("No bottleneck events were emitted for these settings.")
     else:
-        st.dataframe(bottlenecks, hide_index=True, use_container_width=True)
+        st.dataframe(bottlenecks, hide_index=True, width="stretch")
         st_folium(
             build_bottleneck_map(bottlenecks, gps_source_type),
             height=420,
@@ -863,7 +863,7 @@ def render_live_edge_section(mission_dir: Path) -> None:
                     "Last error": values.get("last_error", ""),
                 }
             )
-        st.dataframe(pd.DataFrame(rows), hide_index=True, use_container_width=True)
+        st.dataframe(pd.DataFrame(rows), hide_index=True, width="stretch")
 
     budget = report.get("compute_budget", {}) if isinstance(report, dict) else {}
     if budget:
@@ -921,7 +921,7 @@ def render_anpr_section(artifacts_dir: Path, stage: dict[str, Any] | None = None
         }
         for item in events
     ]
-    st.dataframe(pd.DataFrame(safe_rows), hide_index=True, use_container_width=True)
+    st.dataframe(pd.DataFrame(safe_rows), hide_index=True, width="stretch")
 
     event_ids = [str(item.get("event_id", "")) for item in events]
     selected_id = st.selectbox("Select ANPR evidence", event_ids)
@@ -930,13 +930,13 @@ def render_anpr_section(artifacts_dir: Path, stage: dict[str, Any] | None = None
     with left:
         frame_path = resolve_evidence(selected.get("evidence_frame"), artifacts_dir)
         if frame_path:
-            st.image(str(frame_path), caption="Best observation frame", use_container_width=True)
+            st.image(str(frame_path), caption="Best observation frame", width="stretch")
         else:
             st.info("No context frame was promoted for this event.")
     with right:
         crop_path = resolve_evidence(selected.get("evidence_crop"), artifacts_dir)
         if crop_path:
-            st.image(str(crop_path), caption="Plate crop", use_container_width=True)
+            st.image(str(crop_path), caption="Plate crop", width="stretch")
         st.subheader(str(selected.get("masked_plate", "Masked plate")))
         st.write(f"OCR confidence: **{float(selected.get('mean_ocr_confidence', 0)):.3f}**")
         st.write(f"Winning votes: **{int(selected.get('winning_ocr_votes', 0))}**")
@@ -1066,13 +1066,13 @@ def render_timeline_review(
                 image_columns[0].image(
                     str(frame_path),
                     caption="Context evidence",
-                    use_container_width=True,
+                    width="stretch",
                 )
             if crop_path:
                 image_columns[1].image(
                     str(crop_path),
                     caption="Detection crop",
-                    use_container_width=True,
+                    width="stretch",
                 )
         else:
             st.info("This event has metadata only; no evidence image was promoted.")
@@ -1141,18 +1141,18 @@ def render_command_center(
         if not has_scene:
             st.info("The selected run has no geospatial observations to display.")
         elif renderer == "Offline-safe 3D":
-            st.plotly_chart(build_offline_figure(scene), use_container_width=True)
+            st.plotly_chart(build_offline_figure(scene), width="stretch")
             st.caption("Tile-free 3D renderer · available without venue internet")
         else:
             try:
-                st.pydeck_chart(build_command_deck(scene), use_container_width=True)
+                st.pydeck_chart(build_command_deck(scene), width="stretch")
                 st.caption(
                     "3D operational intelligence map · height represents observed intensity, "
                     "not physical object height"
                 )
             except Exception as exc:
                 st.warning(f"Live map unavailable ({exc}). Showing offline-safe 3D.")
-                st.plotly_chart(build_offline_figure(scene), use_container_width=True)
+                st.plotly_chart(build_offline_figure(scene), width="stretch")
 
     with legend_column:
         render_scene_legend(scene, gps_type)
@@ -1253,7 +1253,7 @@ def render_scan_launcher(runs_root: Path) -> Path | None:
     start_scan = st.button(
         "▶ Run DrishtiPath Scan",
         type="primary",
-        use_container_width=True,
+        width="stretch",
         disabled=not (inputs_ready and all_checks_pass and modules),
     )
 
@@ -1325,7 +1325,7 @@ def main() -> None:
         )
         if selected_run is not None:
             st.session_state["active_run_dir"] = str(selected_run)
-    if st.sidebar.button("Clear active run", use_container_width=True):
+    if st.sidebar.button("Clear active run", width="stretch"):
         st.session_state.pop("active_run_dir", None)
 
     with st.sidebar.expander("Legacy artifact paths"):
@@ -1338,7 +1338,7 @@ def main() -> None:
             "Live edge mission",
             "artifacts/edge_live/latest",
         )
-    if st.sidebar.button("Refresh data", use_container_width=True):
+    if st.sidebar.button("Refresh data", width="stretch"):
         st.cache_data.clear()
         st.rerun()
 

@@ -3,6 +3,6 @@ pandas>=2.0,<3
 ultralytics>=8.4.60,<9
 lap>=0.5.12,<1
 folium>=0.15,<1
-streamlit>=1.30,<2
+streamlit>=1.51,<2
 streamlit-folium>=0.20,<1
 plotly>=5.18,<7
