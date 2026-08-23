@@ -71,8 +71,79 @@ Open the local URL printed by Streamlit, normally `http://localhost:8501`.
 
 ## Use a road-hazard model
 
-The default COCO model does **not** detect potholes. Supply trained weights whose class
-names match the requested hazards:
+The default COCO model does **not** detect potholes. Train or supply RDD2022-based weights
+whose class names match the requested hazards:
+
+### Official RDD2022 source
+
+Download and extract the India subset from the official Road Damage Detector repository:
+
+https://github.com/sekilab/RoadDamageDetector
+
+RDD2022 covers **cracks and potholes** (`D00`, `D10`, `D20`, `D40`). It does **not** by itself
+complete waterlogging, missing-divider or zebra-crossing detection. Those require separate
+labelled datasets and model training.
+
+### Prepare the YOLO dataset
+
+After extracting the India VOC annotations locally:
+
+```bash
+python scripts/prepare_rdd2022.py \
+  --source /path/to/extracted/RDD2022/India \
+  --output datasets/rdd2022_india_yolo \
+  --validation-ratio 0.20 \
+  --seed 26124
+```
+
+This creates `images/`, `labels/`, and `data.yaml` under `datasets/rdd2022_india_yolo/`.
+
+### Train locally
+
+```bash
+python train_road_hazard.py \
+  --data datasets/rdd2022_india_yolo/data.yaml \
+  --model yolov8n.pt \
+  --epochs 50 \
+  --imgsz 640 \
+  --batch 16 \
+  --workers 2 \
+  --project runs/road_hazard \
+  --name yolov8n_rdd2022_india \
+  --seed 26124
+```
+
+### Recommended Google Colab / T4 GPU command
+
+```bash
+!pip install -q ultralytics
+!python scripts/prepare_rdd2022.py --source /content/RDD2022/India --output datasets/rdd2022_india_yolo
+!python train_road_hazard.py \
+  --data datasets/rdd2022_india_yolo/data.yaml \
+  --model yolov8n.pt \
+  --epochs 50 \
+  --imgsz 640 \
+  --batch 16 \
+  --device 0 \
+  --workers 2 \
+  --project runs/road_hazard \
+  --name yolov8n_rdd2022_india_colab \
+  --seed 26124
+```
+
+Copy the printed `best.pt` path locally after training. **Report model accuracy only from
+validation output** (`precision`, `recall`, `mAP50`, `mAP50-95`). Do not substitute per-frame
+detection confidence for dataset-level accuracy.
+
+### Run the trained model in the edge pipeline
+
+```bash
+python orchestrator.py \
+  --model path/to/best.pt \
+  --classes pothole,longitudinal_crack,transverse_crack,alligator_crack
+```
+
+Legacy generic hazard names still work when your custom weights expose them directly:
 
 ```bash
 python orchestrator.py \
@@ -81,9 +152,6 @@ python orchestrator.py \
   --window-size 5 \
   --min-hits 3
 ```
-
-Use an India-relevant labelled validation set and report precision, recall and false-alert
-reduction before presenting accuracy to judges.
 
 ## ANPR incident review
 

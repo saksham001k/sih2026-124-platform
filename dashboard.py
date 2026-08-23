@@ -11,6 +11,8 @@ import streamlit as st
 from folium.plugins import HeatMap
 from streamlit_folium import st_folium
 
+from urban_intelligence.classes import normalize_class_name
+
 st.set_page_config(
     page_title="DrishtiPath Command Centre",
     page_icon="🚌",
@@ -85,12 +87,15 @@ def build_event_map(events: pd.DataFrame) -> folium.Map:
 
     colors = {
         "pothole": "red",
+        "longitudinal_crack": "darkred",
+        "transverse_crack": "orange",
+        "alligator_crack": "pink",
         "person": "orange",
         "truck": "darkblue",
         "car": "blue",
     }
     for _, row in events.iterrows():
-        class_name = str(row["class"])
+        class_name = normalize_class_name(str(row["class"]))
         popup = (
             f"<b>{class_name.title()}</b><br>"
             f"Confidence: {float(row['confidence']):.2f}<br>"
@@ -134,6 +139,8 @@ def main() -> None:
         st.stop()
 
     if not events.empty:
+        events = events.copy()
+        events["class"] = events["class"].astype(str).map(normalize_class_name)
         available_classes = sorted(events["class"].dropna().astype(str).unique())
         selected_classes = st.sidebar.multiselect(
             "Event classes", available_classes, default=available_classes
