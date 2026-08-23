@@ -9,11 +9,13 @@ from typing import Any
 
 import folium
 import pandas as pd
+import pydeck as pdk
 import streamlit as st
 from folium.plugins import HeatMap
 from streamlit_folium import st_folium
 
 from urban_intelligence.classes import normalize_class_name
+from urban_intelligence.command_center import build_operational_scene
 from urban_intelligence.demo_jobs import (
     UploadValidationError,
     list_completed_runs,
@@ -23,6 +25,7 @@ from urban_intelligence.demo_jobs import (
     prepare_run,
     run_analysis,
 )
+from urban_intelligence.gps import load_gps_csv
 
 st.set_page_config(
     page_title="DrishtiPath Command Centre",
@@ -33,17 +36,39 @@ st.set_page_config(
 st.markdown(
     """
     <style>
-      .block-container {padding-top: 1.5rem; padding-bottom: 2rem;}
+      :root {
+        --dp-cyan: #24e0cf;
+        --dp-blue: #4f8cff;
+        --dp-amber: #ffb547;
+        --dp-red: #ff4e59;
+        --dp-panel: rgba(12, 27, 45, .86);
+        --dp-border: rgba(111, 151, 181, .20);
+      }
+      .block-container {padding-top: 1rem; padding-bottom: 2.5rem; max-width: 1560px;}
       [data-testid="stAppViewContainer"] {
         background:
-          radial-gradient(circle at 80% 0%, rgba(0, 214, 200, .10), transparent 30%),
+          radial-gradient(circle at 78% -8%, rgba(36, 224, 207, .14), transparent 30%),
+          radial-gradient(circle at 8% 36%, rgba(79, 140, 255, .09), transparent 25%),
           #07111f;
       }
+      [data-testid="stHeader"] {background: rgba(7, 17, 31, .55);}
+      [data-testid="stSidebar"] {
+        background: linear-gradient(180deg, #091625 0%, #07111f 100%);
+        border-right: 1px solid var(--dp-border);
+      }
       [data-testid="stMetric"] {
-        background: #101c2c;
-        border: 1px solid #26364a;
-        padding: 0.8rem 1rem;
-        border-radius: 0.75rem;
+        background: linear-gradient(145deg, rgba(17, 35, 55, .94), rgba(8, 22, 38, .94));
+        border: 1px solid var(--dp-border);
+        padding: 0.9rem 1rem;
+        border-radius: 0.9rem;
+        box-shadow: 0 16px 36px rgba(0, 0, 0, .12);
+      }
+      [data-testid="stMetricValue"] {color: #f5fbff; letter-spacing: -.025em;}
+      [data-testid="stTabs"] button {font-weight: 650; letter-spacing: .01em;}
+      [data-testid="stFileUploaderDropzone"] {
+        border: 1px dashed rgba(36, 224, 207, .55);
+        background: rgba(14, 35, 52, .65);
+        border-radius: 1rem;
       }
       .status-pill {
         display: inline-block; padding: .25rem .65rem; border-radius: 999px;
@@ -52,9 +77,50 @@ st.markdown(
       .mission-card {
         padding: 1rem 1.1rem; border: 1px solid #26364a; border-radius: .9rem;
         background: linear-gradient(135deg, rgba(16, 28, 44, .96), rgba(8, 20, 35, .96));
+        min-height: 98px;
       }
       .eyebrow {color: #62e6da; font-size: .75rem; letter-spacing: .12em; font-weight: 700;}
       .muted {color: #91a4b7; font-size: .88rem;}
+      .command-hero {
+        position: relative; overflow: hidden; padding: 1.35rem 1.5rem; margin: .15rem 0 1rem;
+        border: 1px solid rgba(36, 224, 207, .24); border-radius: 1.1rem;
+        background:
+          linear-gradient(112deg, rgba(13, 32, 50, .98), rgba(8, 22, 38, .92)),
+          radial-gradient(circle at 80% 20%, rgba(36, 224, 207, .22), transparent 36%);
+        box-shadow: 0 24px 60px rgba(0, 0, 0, .22);
+      }
+      .command-hero::after {
+        content: ""; position: absolute; inset: 0; pointer-events: none; opacity: .18;
+        background-image:
+          linear-gradient(rgba(93, 149, 183, .17) 1px, transparent 1px),
+          linear-gradient(90deg, rgba(93, 149, 183, .17) 1px, transparent 1px);
+        background-size: 34px 34px;
+        mask-image: linear-gradient(90deg, transparent 25%, black 100%);
+      }
+      .hero-title {font-size: 2rem; line-height: 1.08; font-weight: 760; margin: .28rem 0 .45rem;}
+      .hero-meta {color: #a7bac9; font-size: .9rem;}
+      .live-dot {
+        display: inline-block; width: .55rem; height: .55rem; margin-right: .4rem;
+        border-radius: 50%; background: var(--dp-cyan); box-shadow: 0 0 0 rgba(36,224,207,.6);
+        animation: dp-pulse 1.8s infinite;
+      }
+      @keyframes dp-pulse {
+        0% {box-shadow: 0 0 0 0 rgba(36,224,207,.55)}
+        70% {box-shadow: 0 0 0 9px rgba(36,224,207,0)}
+        100% {box-shadow: 0 0 0 0 rgba(36,224,207,0)}
+      }
+      .intel-panel {
+        padding: 1rem 1.05rem; border-radius: 1rem; min-height: 118px;
+        border: 1px solid var(--dp-border); background: var(--dp-panel);
+      }
+      .legend-row {
+        display: flex; align-items: center; gap: .55rem; margin: .58rem 0; color: #b8cad8;
+      }
+      .legend-swatch {width: .7rem; height: .7rem; border-radius: 50%; display: inline-block;}
+      .timeline-card {
+        border-left: 2px solid var(--dp-cyan); padding: .65rem .85rem; margin: .42rem 0;
+        background: rgba(14, 31, 48, .72); border-radius: 0 .7rem .7rem 0;
+      }
     </style>
     """,
     unsafe_allow_html=True,
@@ -88,6 +154,221 @@ def human_bytes(value: int | float) -> str:
             return f"{size:.1f} {unit}"
         size /= 1024
     return f"{size:.1f} GB"
+
+
+def dataframe_records(frame: pd.DataFrame) -> list[dict[str, Any]]:
+    if frame.empty:
+        return []
+    return frame.where(pd.notnull(frame), None).to_dict(orient="records")
+
+
+@st.cache_data(ttl=2)
+def load_route_records(path: str) -> list[dict[str, float]]:
+    gps_path = Path(path)
+    if not gps_path.is_file():
+        return []
+    try:
+        track = load_gps_csv(gps_path)
+    except (OSError, ValueError):
+        return []
+    return [
+        {
+            "timestamp_s": point.timestamp_s,
+            "latitude": point.latitude,
+            "longitude": point.longitude,
+        }
+        for point in track.points
+    ]
+
+
+def build_command_deck(scene: dict[str, Any]) -> pdk.Deck:
+    """Build the online, tiled 3D operational map."""
+    layers: list[pdk.Layer] = []
+    route = scene["route"]
+    if len(route) >= 2:
+        layers.append(
+            pdk.Layer(
+                "PathLayer",
+                data=[{"path": route}],
+                get_path="path",
+                get_color=[36, 224, 207, 210],
+                width_min_pixels=4,
+                get_width=5,
+                joint_rounded=True,
+                cap_rounded=True,
+                pickable=False,
+            )
+        )
+
+    for name, radius in (("traffic", 18), ("hazards", 9)):
+        if not scene[name]:
+            continue
+        layers.append(
+            pdk.Layer(
+                "ColumnLayer",
+                data=scene[name],
+                get_position="position",
+                get_fill_color="color",
+                get_elevation="elevation",
+                radius=radius,
+                disk_resolution=12,
+                elevation_scale=1,
+                extruded=True,
+                pickable=True,
+                auto_highlight=True,
+            )
+        )
+
+    for name in ("bottlenecks", "anpr"):
+        if not scene[name]:
+            continue
+        layers.append(
+            pdk.Layer(
+                "ScatterplotLayer",
+                data=scene[name],
+                get_position="position",
+                get_fill_color="color",
+                get_line_color=[245, 251, 255, 235],
+                get_radius="radius",
+                radius_min_pixels=8,
+                radius_max_pixels=22,
+                line_width_min_pixels=2,
+                stroked=True,
+                filled=True,
+                pickable=True,
+                auto_highlight=True,
+            )
+        )
+
+    center = scene["center"]
+    return pdk.Deck(
+        layers=layers,
+        initial_view_state=pdk.ViewState(
+            latitude=center["latitude"],
+            longitude=center["longitude"],
+            zoom=center["zoom"],
+            pitch=58,
+            bearing=-24,
+        ),
+        map_style="https://basemaps.cartocdn.com/gl/dark-matter-gl-style/style.json",
+        tooltip={"text": "{kind}\n{label}\nStatus: {status}"},
+    )
+
+
+def build_offline_figure(scene: dict[str, Any]):
+    """Build a tile-free Plotly 3D scene for unreliable venue internet."""
+    import plotly.graph_objects as go
+
+    figure = go.Figure()
+    route = scene["route"]
+    if route:
+        figure.add_trace(
+            go.Scatter3d(
+                x=[position[0] for position in route],
+                y=[position[1] for position in route],
+                z=[0] * len(route),
+                mode="lines",
+                line={"color": "#24E0CF", "width": 7},
+                name="Bus route",
+                hoverinfo="name",
+            )
+        )
+
+    layer_styles = {
+        "traffic": ("Traffic density", "#1ADCC6", 5),
+        "hazards": ("Road hazards", "#FF6A57", 8),
+        "bottlenecks": ("Bottlenecks", "#FF3148", 11),
+        "anpr": ("ANPR evidence", "#469BFF", 10),
+    }
+    for layer_name, (display_name, color, marker_size) in layer_styles.items():
+        points = scene[layer_name]
+        if not points:
+            continue
+        line_x: list[float | None] = []
+        line_y: list[float | None] = []
+        line_z: list[float | None] = []
+        for point in points:
+            longitude, latitude = point["position"]
+            line_x.extend([longitude, longitude, None])
+            line_y.extend([latitude, latitude, None])
+            line_z.extend([0, point["elevation"], None])
+        figure.add_trace(
+            go.Scatter3d(
+                x=line_x,
+                y=line_y,
+                z=line_z,
+                mode="lines",
+                line={"color": color, "width": 6},
+                hoverinfo="skip",
+                showlegend=False,
+            )
+        )
+        figure.add_trace(
+            go.Scatter3d(
+                x=[point["position"][0] for point in points],
+                y=[point["position"][1] for point in points],
+                z=[point["elevation"] for point in points],
+                mode="markers",
+                marker={"color": color, "size": marker_size, "opacity": 0.92},
+                text=[f"{point['label']}<br>{point['status']}" for point in points],
+                hovertemplate="%{text}<extra></extra>",
+                name=display_name,
+            )
+        )
+
+    figure.update_layout(
+        height=590,
+        margin={"l": 0, "r": 0, "t": 8, "b": 0},
+        paper_bgcolor="#081625",
+        plot_bgcolor="#081625",
+        font={"color": "#DCECF4"},
+        legend={"orientation": "h", "y": 0.98, "x": 0.02, "bgcolor": "rgba(0,0,0,0)"},
+        scene={
+            "bgcolor": "#081625",
+            "camera": {"eye": {"x": 1.55, "y": -1.55, "z": 1.12}},
+            "aspectmode": "auto",
+            "xaxis": {
+                "title": "Longitude",
+                "gridcolor": "rgba(82,132,163,.22)",
+                "showbackground": False,
+            },
+            "yaxis": {
+                "title": "Latitude",
+                "gridcolor": "rgba(82,132,163,.22)",
+                "showbackground": False,
+            },
+            "zaxis": {
+                "title": "Intensity",
+                "gridcolor": "rgba(82,132,163,.22)",
+                "showbackground": False,
+            },
+        },
+    )
+    return figure
+
+
+def load_operational_scene(
+    *,
+    active_run: Path,
+    road_dir: Path,
+    traffic_dir: Path,
+    anpr_dir: Path,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    road_events = load_csv(str(road_dir / "events.csv"))
+    traffic_windows = load_csv(str(traffic_dir / "traffic_timeseries.csv"))
+    bottlenecks = load_csv(str(traffic_dir / "bottleneck_events.csv"))
+    anpr_value = load_json(str(anpr_dir / "anpr_events.json"))
+    anpr_events = anpr_value if isinstance(anpr_value, list) else []
+    traffic_summary = load_json(str(traffic_dir / "traffic_summary.json"))
+    route_records = load_route_records(str(active_run / "input" / "gps.csv"))
+    scene = build_operational_scene(
+        route_records=route_records,
+        road_events=dataframe_records(road_events),
+        traffic_windows=dataframe_records(traffic_windows),
+        bottleneck_events=dataframe_records(bottlenecks),
+        anpr_events=anpr_events,
+    )
+    return scene, traffic_summary if isinstance(traffic_summary, dict) else {}
 
 
 def build_event_map(events: pd.DataFrame) -> folium.Map:
@@ -606,6 +887,184 @@ def render_run_summary(run_dir: Path) -> dict[str, Any]:
     return manifest
 
 
+def render_scene_legend(scene: dict[str, Any], gps_type: str) -> None:
+    counts = scene["counts"]
+    gps_label = "REAL TELEMETRY" if gps_type == "real_telemetry" else "SYNTHETIC DEMO"
+    gps_color = "#7EF0BD" if gps_type == "real_telemetry" else "#FFCF70"
+    st.markdown(
+        "<div class='intel-panel'>"
+        "<div class='eyebrow'>OPERATIONAL LAYERS</div>"
+        "<div class='legend-row'><span class='legend-swatch' style='background:#24E0CF'></span>"
+        "Bus trajectory</div>"
+        f"<div class='legend-row'><span class='legend-swatch' style='background:#FF6A57'></span>"
+        f"Road hazards · {counts['hazards']}</div>"
+        f"<div class='legend-row'><span class='legend-swatch' style='background:#1ADCC6'></span>"
+        f"Traffic windows · {counts['traffic_windows']}</div>"
+        f"<div class='legend-row'><span class='legend-swatch' style='background:#FF3148'></span>"
+        f"Bottlenecks · {counts['bottlenecks']}</div>"
+        f"<div class='legend-row'><span class='legend-swatch' style='background:#469BFF'></span>"
+        f"Masked ANPR · {counts['anpr']}</div>"
+        "</div>",
+        unsafe_allow_html=True,
+    )
+    st.markdown(
+        f"<div class='intel-panel' style='margin-top:.75rem'>"
+        f"<div class='eyebrow'>GPS PROVENANCE</div>"
+        f"<div style='font-size:1.15rem;font-weight:700;color:{gps_color};margin:.4rem 0'>"
+        f"{gps_label}</div>"
+        "<div class='muted'>Every visual coordinate preserves its declared source type.</div>"
+        "</div>",
+        unsafe_allow_html=True,
+    )
+
+
+def render_timeline_review(
+    scene: dict[str, Any],
+    *,
+    road_dir: Path,
+    anpr_dir: Path,
+) -> None:
+    timeline = scene["timeline"]
+    st.subheader("Intelligence timeline")
+    if not timeline:
+        st.info("No confirmed hazard, bottleneck, or ANPR events entered the review queue.")
+        return
+
+    left, right = st.columns([1.05, 1.4])
+    with left:
+        selected_index = st.selectbox(
+            "Select evidence",
+            range(len(timeline)),
+            key="command_timeline_event",
+            format_func=lambda index: (
+                f"{float(timeline[index]['time_s']):06.1f}s · "
+                f"{timeline[index]['title']} · {timeline[index]['detail']}"
+            ),
+        )
+        selected = timeline[selected_index]
+        st.markdown(
+            "<div class='timeline-card'>"
+            f"<div class='eyebrow'>{escape(str(selected['kind']).upper())} · "
+            f"{float(selected['time_s']):.1f} SECONDS</div>"
+            f"<div style='font-size:1.15rem;font-weight:700;margin:.25rem 0'>"
+            f"{escape(str(selected['title']))}</div>"
+            f"<div class='muted'>{escape(str(selected['detail']))}</div>"
+            f"<div class='muted'>Status · {escape(str(selected['status']))}</div>"
+            "</div>",
+            unsafe_allow_html=True,
+        )
+        st.caption(
+            "Timeline events are generated by automated quality gates and remain pending "
+            "human verification."
+        )
+
+    with right:
+        source_dir = road_dir if selected["kind"] == "road" else anpr_dir
+        frame_path = resolve_evidence(selected.get("evidence_frame"), source_dir)
+        crop_path = resolve_evidence(selected.get("evidence_crop"), source_dir)
+        if frame_path or crop_path:
+            image_columns = st.columns([1.5, 1])
+            if frame_path:
+                image_columns[0].image(
+                    str(frame_path),
+                    caption="Context evidence",
+                    use_container_width=True,
+                )
+            if crop_path:
+                image_columns[1].image(
+                    str(crop_path),
+                    caption="Detection crop",
+                    use_container_width=True,
+                )
+        else:
+            st.info("This event has metadata only; no evidence image was promoted.")
+
+
+def render_command_center(
+    *,
+    active_run: Path,
+    road_dir: Path,
+    traffic_dir: Path,
+    anpr_dir: Path,
+    manifest: dict[str, Any],
+) -> None:
+    scene, traffic_summary = load_operational_scene(
+        active_run=active_run,
+        road_dir=road_dir,
+        traffic_dir=traffic_dir,
+        anpr_dir=anpr_dir,
+    )
+    road_metrics = load_json(str(road_dir / "metrics.json"))
+    road_metrics = road_metrics if isinstance(road_metrics, dict) else {}
+    gps_type = str(manifest.get("gps_source_type", "unknown"))
+    run_status = str(manifest.get("status", "unknown")).replace("_", " ").upper()
+    video_name = (
+        manifest.get("input", {}).get("video", {}).get("original_name", "Dashcam mission")
+    )
+
+    st.markdown(
+        "<div class='command-hero'>"
+        "<div class='eyebrow'><span class='live-dot'></span>DRISHTIPATH · LIVE MISSION VIEW</div>"
+        f"<div class='hero-title'>{escape(str(video_name))}</div>"
+        f"<div class='hero-meta'>Run {escape(active_run.name)} · {escape(run_status)} · "
+        "Edge-processed intelligence with review-safe evidence</div>"
+        "</div>",
+        unsafe_allow_html=True,
+    )
+
+    unique_vehicles = int(traffic_summary.get("total_unique_tracked_vehicles", 0))
+    mean_occupancy = float(traffic_summary.get("average_occupancy", 0)) * 100
+    edge_fps = float(
+        road_metrics.get(
+            "end_to_end_fps",
+            traffic_summary.get("processing_fps", 0),
+        )
+    )
+    metric_columns = st.columns(6)
+    metric_columns[0].metric("Confirmed hazards", scene["counts"]["hazards"])
+    metric_columns[1].metric("Unique vehicles", unique_vehicles)
+    metric_columns[2].metric("Bottlenecks", scene["counts"]["bottlenecks"])
+    metric_columns[3].metric("ANPR review", scene["counts"]["anpr"])
+    metric_columns[4].metric("Edge throughput", f"{edge_fps:.1f} FPS")
+    metric_columns[5].metric("Mean occupancy", f"{mean_occupancy:.1f}%")
+
+    map_column, legend_column = st.columns([2.7, 0.9])
+    with map_column:
+        renderer = st.radio(
+            "Operational scene renderer",
+            ["Live 3D map", "Offline-safe 3D"],
+            horizontal=True,
+            help=(
+                "Live mode uses external Carto map tiles. Offline-safe mode uses no "
+                "external basemap and is recommended for unreliable venue internet."
+            ),
+        )
+        has_scene = bool(scene["route"]) or any(scene["counts"].values())
+        if not has_scene:
+            st.info("The selected run has no geospatial observations to display.")
+        elif renderer == "Offline-safe 3D":
+            st.plotly_chart(build_offline_figure(scene), use_container_width=True)
+            st.caption("Tile-free 3D renderer · available without venue internet")
+        else:
+            try:
+                st.pydeck_chart(build_command_deck(scene), use_container_width=True)
+                st.caption(
+                    "3D operational intelligence map · height represents observed intensity, "
+                    "not physical object height"
+                )
+            except Exception as exc:
+                st.warning(f"Live map unavailable ({exc}). Showing offline-safe 3D.")
+                st.plotly_chart(build_offline_figure(scene), use_container_width=True)
+
+    with legend_column:
+        render_scene_legend(scene, gps_type)
+
+    render_timeline_review(scene, road_dir=road_dir, anpr_dir=anpr_dir)
+
+    with st.expander("Pipeline integrity and provenance"):
+        render_run_summary(active_run)
+
+
 def render_scan_launcher(runs_root: Path) -> Path | None:
     st.markdown(
         "<div class='eyebrow'>NEW INTELLIGENCE MISSION</div>",
@@ -783,10 +1242,10 @@ def main() -> None:
 
     edge_report_path = Path(edge_report_value)
 
-    scan_tab, overview_tab, road_tab, traffic_tab, anpr_tab, edge_tab = st.tabs(
+    scan_tab, command_tab, road_tab, traffic_tab, anpr_tab, edge_tab = st.tabs(
         [
             "New scan",
-            "Mission summary",
+            "3D command centre",
             "Road hazards",
             "Traffic analytics",
             "ANPR review",
@@ -805,12 +1264,24 @@ def main() -> None:
     anpr_dir = active_run / "anpr" if active_run else Path(artifacts_value)
     manifest = load_manifest(active_run) if active_run else {}
 
-    with overview_tab:
+    with command_tab:
         if active_run:
-            st.subheader(active_run.name)
-            render_run_summary(active_run)
+            render_command_center(
+                active_run=active_run,
+                road_dir=road_dir,
+                traffic_dir=traffic_dir,
+                anpr_dir=anpr_dir,
+                manifest=manifest,
+            )
         else:
-            st.info("Run a new scan or select a previous dashboard run from the sidebar.")
+            st.markdown(
+                "<div class='command-hero'>"
+                "<div class='eyebrow'>DRISHTIPATH · MISSION CONTROL</div>"
+                "<div class='hero-title'>Your city intelligence view begins with one upload.</div>"
+                "<div class='hero-meta'>Run a new scan or select a previous dashboard run "
+                "from the sidebar.</div></div>",
+                unsafe_allow_html=True,
+            )
 
     events = load_csv(str(road_dir / "events.csv"))
     detections = load_csv(str(road_dir / "detections.csv"))
