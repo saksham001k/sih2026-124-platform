@@ -13,6 +13,7 @@ from urban_intelligence.edge_runtime import (
     ModelSchedule,
     active_geofence_keys,
     build_runtime_report,
+    detect_execution_environment,
     estimate_compute_utilization,
     sample_device_health,
 )
@@ -209,6 +210,29 @@ def test_device_health_reads_pi_files_without_collecting_identity(tmp_path: Path
     assert result["memory_available_mb"] == 4000
     assert "hostname" not in result
     assert "username" not in result
+
+
+def test_execution_environment_rejects_x86_pi_impersonation(tmp_path: Path) -> None:
+    assert (
+        detect_execution_environment(
+            device_model="Raspberry Pi 4 Model B",
+            machine="x86_64",
+            container_marker_paths=(),
+            dmi_product_path=tmp_path / "missing-dmi",
+            hypervisor_path=tmp_path / "missing-hypervisor",
+        )
+        == "emulated"
+    )
+    assert (
+        detect_execution_environment(
+            device_model="Raspberry Pi 5 Model B",
+            machine="aarch64",
+            container_marker_paths=(),
+            dmi_product_path=tmp_path / "missing-dmi",
+            hypervisor_path=tmp_path / "missing-hypervisor",
+        )
+        == "physical_device"
+    )
 
 
 def test_runtime_report_separates_capture_rate_from_analytics_rate() -> None:

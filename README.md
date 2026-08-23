@@ -467,6 +467,26 @@ Only an all-pass report on detected Raspberry Pi hardware with live serial NMEA,
 runtime/capture, successful analytics, no capture/model errors, and measured compute headroom
 sets `field_verified: true`.
 
+### Virtual Raspberry Pi integration test
+
+Before moving to physical hardware, run the deterministic application-level Pi profile:
+
+```bash
+python virtual_pi_test.py \
+  --output-dir artifacts/virtual_pi/run-001 \
+  --frames 240 \
+  --frame-delay-ms 20
+```
+
+This exercises synthetic dashcam capture, mixed-rate traffic/road/asset scheduling, the real
+NMEA parser through a virtual serial stream, temporal evidence confirmation, disk outbox,
+authenticated central ingestion, duplicate replay safety, fleet export and the field-claim
+gate. Its report is written to `virtual_pi_report.json`.
+
+This is **not ARM or physical-Pi benchmarking**. The report always declares
+`execution_environment: emulated`; the field gate must return `field_verified: false`.
+Only a physical camera/GPS mission can remove that limitation.
+
 See [real-time edge deployment](docs/REALTIME_EDGE.md) for the scheduling contract,
 dashcam checks, geofence format, artifacts, and honest claim boundary.
 
