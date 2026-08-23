@@ -517,7 +517,7 @@ def render_road_hazard_section(
             st.dataframe(
                 filtered_events[display_columns],
                 hide_index=True,
-                use_container_width=True,
+                width="stretch",
             )
         annotated_path = artifacts_dir / "annotated.mp4"
         if annotated_path.is_file():
@@ -534,13 +534,13 @@ def render_road_hazard_section(
             with left:
                 frame_path = resolve_evidence(event.get("evidence_frame"), artifacts_dir)
                 if frame_path:
-                    st.image(str(frame_path), caption="Context frame", use_container_width=True)
+                    st.image(str(frame_path), caption="Context frame", width="stretch")
                 else:
                     st.info("Context image was not generated for this event.")
             with right:
                 crop_path = resolve_evidence(event.get("evidence_crop"), artifacts_dir)
                 if crop_path:
-                    st.image(str(crop_path), caption="Detection crop", use_container_width=True)
+                    st.image(str(crop_path), caption="Detection crop", width="stretch")
                 st.subheader(str(event["class"]).title())
                 st.write(f"Confidence: **{float(event['confidence']):.2f}**")
                 st.write(f"Video time: **{float(event['video_time_s']):.2f} s**")
@@ -660,7 +660,7 @@ def render_traffic_section(artifacts_dir: Path) -> None:
     if bottlenecks.empty:
         st.info("No bottleneck events were emitted for these settings.")
     else:
-        st.dataframe(bottlenecks, hide_index=True, use_container_width=True)
+        st.dataframe(bottlenecks, hide_index=True, width="stretch")
         st_folium(
             build_bottleneck_map(bottlenecks, gps_source_type),
             height=420,
@@ -786,6 +786,104 @@ def render_edge_benchmark_section(report_path: Path) -> None:
         st.json(report)
 
 
+def render_live_edge_section(mission_dir: Path) -> None:
+    """Render privacy-safe status emitted by ``edge_agent.py``."""
+    st.subheader("Live edge mission")
+    st.caption(
+        "Capture and analytics are measured separately. The dashcam may capture at 30 FPS "
+        "while mixed-rate edge models analyze selected fresh frames without building a backlog."
+    )
+    status = load_json(str(mission_dir / "device_status.json"))
+    report = load_json(str(mission_dir / "metrics.json"))
+    if not isinstance(status, dict) or not status:
+        st.info(
+            "No live edge status found. Start the agent on a Raspberry Pi or use a recorded "
+            "route replay, then point the sidebar to its mission directory."
+        )
+        st.code(
+            "python edge_agent.py --source 0 --fixed-gps 28.6139,77.2090 "
+            "--gps-source-type synthetic_demo --profile pi4 "
+            "--output-dir artifacts/edge_live/latest",
+            language="bash",
+        )
+        return
+
+    capture = status.get("capture", {})
+    schedules = status.get("scheduler", {}).get("schedules", {})
+    temperature = status.get("cpu_temperature_c")
+    available_memory = status.get("memory_available_mb")
+    device_name = status.get("device_model") or (
+        f"{status.get('platform', 'Unknown')} · {status.get('machine', 'unknown')}"
+    )
+    pi_label = "RASPBERRY PI VERIFIED" if status.get("raspberry_pi") else "NON-PI RUNTIME"
+    mission_status = str(status.get("mission_status", "running")).replace("_", " ").upper()
+
+    st.markdown(
+        "<div class='mission-card'>"
+        f"<div class='eyebrow'><span class='live-dot'></span>{escape(mission_status)}</div>"
+        f"<div style='font-size:1.25rem;font-weight:720;margin:.3rem 0'>"
+        f"{escape(str(device_name))}</div>"
+        f"<div class='muted'>{escape(pi_label)} · privacy-safe device telemetry</div>"
+        "</div>",
+        unsafe_allow_html=True,
+    )
+
+    captured = int(capture.get("captured_frames", 0))
+    dropped = int(capture.get("dropped_analysis_frames", 0))
+    drop_rate = dropped / captured * 100 if captured else 0.0
+    analytics_attempts = int(report.get("analytics_attempts", 0)) if report else sum(
+        int(values.get("attempted", 0)) for values in schedules.values()
+    )
+    columns = st.columns(6)
+    columns[0].metric("Captured frames", captured)
+    columns[1].metric("Analytics runs", analytics_attempts)
+    columns[2].metric("Dropped for freshness", dropped, f"{drop_rate:.1f}%")
+    columns[3].metric(
+        "CPU temperature",
+        "Unavailable" if temperature is None else f"{float(temperature):.1f} °C",
+    )
+    columns[4].metric(
+        "Available memory",
+        "Unavailable" if available_memory is None else f"{float(available_memory):.0f} MB",
+    )
+    columns[5].metric("Evidence queued", int(report.get("pending_evidence_packets", 0)))
+
+    if schedules:
+        rows = []
+        for name, values in schedules.items():
+            rows.append(
+                {
+                    "Capability": str(name).replace("_", " ").title(),
+                    "Activation": values.get("activation", "unknown"),
+                    "Target FPS": values.get("target_fps", 0),
+                    "Attempts": values.get("attempted", 0),
+                    "Succeeded": values.get("succeeded", 0),
+                    "Mean latency (ms)": values.get("mean_latency_ms", 0),
+                    "Max latency (ms)": values.get("max_latency_ms", 0),
+                    "Last error": values.get("last_error", ""),
+                }
+            )
+        st.dataframe(pd.DataFrame(rows), hide_index=True, width="stretch")
+
+    budget = report.get("compute_budget", {}) if isinstance(report, dict) else {}
+    if budget:
+        utilization = float(budget.get("estimated_utilization", 0))
+        if budget.get("overloaded"):
+            st.error(
+                f"Measured schedule demand is {utilization * 100:.1f}% of one inference "
+                "worker. Reduce model rates or resolution before field deployment."
+            )
+        else:
+            st.success(
+                f"Measured schedule demand is {utilization * 100:.1f}% of one inference "
+                "worker. This is a device-specific measurement, not a general Pi claim."
+            )
+    if status.get("active_geofences"):
+        st.write("Active geofences:", ", ".join(status["active_geofences"]))
+    with st.expander("Privacy-safe device status JSON"):
+        st.json(status)
+
+
 def render_anpr_section(artifacts_dir: Path, stage: dict[str, Any] | None = None) -> None:
     events_value = load_json(str(artifacts_dir / "anpr_events.json"))
     metrics = load_json(str(artifacts_dir / "metrics.json"))
@@ -823,7 +921,7 @@ def render_anpr_section(artifacts_dir: Path, stage: dict[str, Any] | None = None
         }
         for item in events
     ]
-    st.dataframe(pd.DataFrame(safe_rows), hide_index=True, use_container_width=True)
+    st.dataframe(pd.DataFrame(safe_rows), hide_index=True, width="stretch")
 
     event_ids = [str(item.get("event_id", "")) for item in events]
     selected_id = st.selectbox("Select ANPR evidence", event_ids)
@@ -832,13 +930,13 @@ def render_anpr_section(artifacts_dir: Path, stage: dict[str, Any] | None = None
     with left:
         frame_path = resolve_evidence(selected.get("evidence_frame"), artifacts_dir)
         if frame_path:
-            st.image(str(frame_path), caption="Best observation frame", use_container_width=True)
+            st.image(str(frame_path), caption="Best observation frame", width="stretch")
         else:
             st.info("No context frame was promoted for this event.")
     with right:
         crop_path = resolve_evidence(selected.get("evidence_crop"), artifacts_dir)
         if crop_path:
-            st.image(str(crop_path), caption="Plate crop", use_container_width=True)
+            st.image(str(crop_path), caption="Plate crop", width="stretch")
         st.subheader(str(selected.get("masked_plate", "Masked plate")))
         st.write(f"OCR confidence: **{float(selected.get('mean_ocr_confidence', 0)):.3f}**")
         st.write(f"Winning votes: **{int(selected.get('winning_ocr_votes', 0))}**")
@@ -968,13 +1066,13 @@ def render_timeline_review(
                 image_columns[0].image(
                     str(frame_path),
                     caption="Context evidence",
-                    use_container_width=True,
+                    width="stretch",
                 )
             if crop_path:
                 image_columns[1].image(
                     str(crop_path),
                     caption="Detection crop",
-                    use_container_width=True,
+                    width="stretch",
                 )
         else:
             st.info("This event has metadata only; no evidence image was promoted.")
@@ -1043,18 +1141,18 @@ def render_command_center(
         if not has_scene:
             st.info("The selected run has no geospatial observations to display.")
         elif renderer == "Offline-safe 3D":
-            st.plotly_chart(build_offline_figure(scene), use_container_width=True)
+            st.plotly_chart(build_offline_figure(scene), width="stretch")
             st.caption("Tile-free 3D renderer · available without venue internet")
         else:
             try:
-                st.pydeck_chart(build_command_deck(scene), use_container_width=True)
+                st.pydeck_chart(build_command_deck(scene), width="stretch")
                 st.caption(
                     "3D operational intelligence map · height represents observed intensity, "
                     "not physical object height"
                 )
             except Exception as exc:
                 st.warning(f"Live map unavailable ({exc}). Showing offline-safe 3D.")
-                st.plotly_chart(build_offline_figure(scene), use_container_width=True)
+                st.plotly_chart(build_offline_figure(scene), width="stretch")
 
     with legend_column:
         render_scene_legend(scene, gps_type)
@@ -1155,7 +1253,7 @@ def render_scan_launcher(runs_root: Path) -> Path | None:
     start_scan = st.button(
         "▶ Run DrishtiPath Scan",
         type="primary",
-        use_container_width=True,
+        width="stretch",
         disabled=not (inputs_ready and all_checks_pass and modules),
     )
 
@@ -1227,7 +1325,7 @@ def main() -> None:
         )
         if selected_run is not None:
             st.session_state["active_run_dir"] = str(selected_run)
-    if st.sidebar.button("Clear active run", use_container_width=True):
+    if st.sidebar.button("Clear active run", width="stretch"):
         st.session_state.pop("active_run_dir", None)
 
     with st.sidebar.expander("Legacy artifact paths"):
@@ -1236,13 +1334,17 @@ def main() -> None:
             "Edge benchmark report",
             "artifacts/edge_bench/road_hazards_onnx_fp32.json",
         )
-    if st.sidebar.button("Refresh data", use_container_width=True):
+        live_edge_value = st.text_input(
+            "Live edge mission",
+            "artifacts/edge_live/latest",
+        )
+    if st.sidebar.button("Refresh data", width="stretch"):
         st.cache_data.clear()
         st.rerun()
 
     edge_report_path = Path(edge_report_value)
 
-    scan_tab, command_tab, road_tab, traffic_tab, anpr_tab, edge_tab = st.tabs(
+    scan_tab, command_tab, road_tab, traffic_tab, anpr_tab, edge_tab, live_edge_tab = st.tabs(
         [
             "New scan",
             "3D command centre",
@@ -1250,6 +1352,7 @@ def main() -> None:
             "Traffic analytics",
             "ANPR review",
             "Edge benchmark",
+            "Live edge",
         ]
     )
     with scan_tab:
@@ -1302,6 +1405,8 @@ def main() -> None:
         render_anpr_section(anpr_dir, stage)
     with edge_tab:
         render_edge_benchmark_section(edge_report_path)
+    with live_edge_tab:
+        render_live_edge_section(Path(live_edge_value))
 
 
 if __name__ == "__main__":

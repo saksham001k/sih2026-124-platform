@@ -1,4 +1,4 @@
-.PHONY: test process bandwidth dashboard
+.PHONY: test process bandwidth dashboard edge-replay
 
 test:
 	python -m pytest
@@ -11,3 +11,8 @@ bandwidth:
 
 dashboard:
 	streamlit run dashboard.py
+
+edge-replay:
+	python edge_agent.py --source input_video.mp4 --gps-csv gps_data.csv \
+		--gps-source-type synthetic_demo --profile desktop \
+		--output-dir artifacts/edge_live/latest

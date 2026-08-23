@@ -360,6 +360,51 @@ only to that machine (`hardware_scope: current_machine_only`).
 
 View reports in the dashboard **Edge benchmark** tab.
 
+## Live dashcam edge agent
+
+`edge_agent.py` is the real-time runtime boundary for a USB/UVC dashcam, recorded route,
+or RTSP source. It uses a bounded newest-frame buffer and one inference worker so slow
+analytics never create an increasingly stale queue. Traffic and road-damage models run
+at independent measured rates; an optional urban-assets model runs at a lower rate.
+
+Recorded, real-time-paced route replay:
+
+```bash
+python edge_agent.py \
+  --source clips/input_video.mp4 \
+  --gps-csv gps_data.csv \
+  --gps-source-type synthetic_demo \
+  --profile desktop \
+  --output-dir artifacts/edge_live/latest
+```
+
+Raspberry Pi camera example after confirming that the dashcam appears as `/dev/video0`:
+
+```bash
+python edge_agent.py \
+  --source 0 \
+  --gps-csv route_gps.csv \
+  --gps-source-type real_telemetry \
+  --profile pi4 \
+  --road-model models/road_hazards_ncnn_model \
+  --traffic-model models/traffic_ncnn_model \
+  --device cpu \
+  --output-dir artifacts/edge_live/pi-field-test
+```
+
+The `pi4`, `pi5`, and `desktop` rates are conservative configuration starting points,
+not benchmark results. Each run writes actual per-model attempts and latency, captured
+versus dropped analysis frames, memory, temperature, device identity from Linux
+device-tree, and a computed single-worker load estimate. The dashboard **Live edge** tab
+visualizes `device_status.json` and `metrics.json`.
+
+Confirmed road or asset detections enter an atomic disk-backed outbox. Loss of 4G does
+not discard evidence; network delivery and acknowledgement are intentionally a separate
+adapter. No continuous video upload is performed by this runtime.
+
+See [real-time edge deployment](docs/REALTIME_EDGE.md) for the scheduling contract,
+dashcam checks, geofence format, artifacts, and honest claim boundary.
+
 ## Generated artifacts
 
 `orchestrator.py` writes to `artifacts/latest/`:
@@ -389,6 +434,11 @@ push and pull request.
 - Included GPS is synthetic and is clearly labelled as demo data.
 - Standard `yolov8n.pt` demonstrates traffic objects, not road-condition classes.
 - Raspberry Pi performance has not been claimed until the target-device report is saved.
+- Live serial/NMEA GPS and remote outbox delivery adapters are not yet implemented; the
+  live agent currently accepts timestamped GPS CSV replay or an explicitly labelled fixed
+  demo coordinate.
+- Real-time ANPR remains trigger-adapter work; the existing reviewed FastALPR pipeline is
+  available for uploaded or retained incident clips.
 - Hit-and-run classification is not inferred merely from a detected vehicle.
 - Number plates and faces must follow authorization, retention and access-control policies.
 - Origin–destination analytics requires multiple vehicles, route IDs and a larger dataset.
