@@ -234,26 +234,84 @@ def test_anpr_module_imports_without_optional_runtime() -> None:
     assert "create_alpr_engine" in dir(anpr_pipeline)
 
 
-def test_run_pipeline_masks_console_plates(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
-    import cv2
-    import numpy as np
+class _FakeCrop:
+    size = 1
+
+
+class _FakeFrame:
+    shape = (120, 160, 3)
+
+    def copy(self) -> _FakeFrame:
+        return _FakeFrame()
+
+    def __getitem__(self, _key: object) -> _FakeCrop:
+        return _FakeCrop()
+
+
+class _FakeVideoCapture:
+    CAP_PROP_FPS = 5
+    CAP_PROP_FRAME_WIDTH = 3
+    CAP_PROP_FRAME_HEIGHT = 4
+
+    def __init__(self, _path: str, *, frame_count: int = 5) -> None:
+        self._frames_left = frame_count
+
+    def isOpened(self) -> bool:
+        return True
+
+    def get(self, prop: int) -> float | int:
+        if prop == self.CAP_PROP_FPS:
+            return 5.0
+        if prop == self.CAP_PROP_FRAME_WIDTH:
+            return 160
+        if prop == self.CAP_PROP_FRAME_HEIGHT:
+            return 120
+        return 0
+
+    def read(self) -> tuple[bool, _FakeFrame | None]:
+        if self._frames_left <= 0:
+            return False, None
+        self._frames_left -= 1
+        return True, _FakeFrame()
+
+    def release(self) -> None:
+        return None
+
+
+class _FakeCv2:
+    CAP_PROP_FPS = _FakeVideoCapture.CAP_PROP_FPS
+    CAP_PROP_FRAME_WIDTH = _FakeVideoCapture.CAP_PROP_FRAME_WIDTH
+    CAP_PROP_FRAME_HEIGHT = _FakeVideoCapture.CAP_PROP_FRAME_HEIGHT
+    IMWRITE_JPEG_QUALITY = 1
+
+    @staticmethod
+    def VideoCapture(path: str) -> _FakeVideoCapture:
+        return _FakeVideoCapture(path)
+
+    @staticmethod
+    def imwrite(path: str, _frame: object, _params: list[int] | None = None) -> bool:
+        from pathlib import Path
+
+        Path(path).parent.mkdir(parents=True, exist_ok=True)
+        Path(path).write_bytes(b"fake-jpeg")
+        return True
+
+
+def test_run_pipeline_masks_console_plates(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import sys
+
+    monkeypatch.setitem(sys.modules, "cv2", _FakeCv2())
 
     video_path = tmp_path / "clip.mp4"
+    video_path.write_bytes(b"fake-video")
     gps_path = tmp_path / "gps.csv"
     gps_path.write_text(
         "timestamp,lat,lon\n0,28.6139,77.2090\n10,28.6138,77.2091\n",
         encoding="utf-8",
     )
-
-    writer = cv2.VideoWriter(
-        str(video_path),
-        cv2.VideoWriter_fourcc(*"mp4v"),
-        5.0,
-        (160, 120),
-    )
-    for _ in range(5):
-        writer.write(np.zeros((120, 160, 3), dtype=np.uint8))
-    writer.release()
 
     frame_counter = {"value": 0}
 
