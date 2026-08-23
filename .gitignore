@@ -13,6 +13,9 @@ __pycache__/
 .idea/
 
 # Models and datasets
+datasets/
+models/
+runs/
 libs/
 *.h5
 *.pt

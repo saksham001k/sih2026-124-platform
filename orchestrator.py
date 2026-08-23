@@ -10,7 +10,14 @@ import time
 from pathlib import Path
 from typing import Any
 
-from urban_intelligence import Detection, TemporalEventFilter, haversine_m, load_gps_csv
+from urban_intelligence import (
+    Detection,
+    TemporalEventFilter,
+    class_matches_filter,
+    haversine_m,
+    load_gps_csv,
+    normalize_class_name,
+)
 
 DETECTION_COLUMNS = [
     "frame_index",
@@ -183,8 +190,8 @@ def main() -> None:
                 if result.boxes is not None:
                     for box in result.boxes:
                         class_id = int(box.cls[0])
-                        class_name = str(model.names[class_id])
-                        if allowed_classes and class_name.lower() not in allowed_classes:
+                        class_name = normalize_class_name(str(model.names[class_id]))
+                        if not class_matches_filter(class_name, allowed_classes):
                             continue
                         confidence = float(box.conf[0])
                         x1, y1, x2, y2 = map(int, box.xyxy[0].tolist())
