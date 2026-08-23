@@ -20,14 +20,10 @@ class Detection:
 
     @property
     def temporal_key(self) -> str:
-        """Return a stable tracker key, with a coarse spatial fallback."""
+        """Return the tracker key when available; otherwise mark as untracked."""
         if self.track_id is not None:
             return f"{self.class_name}:{self.track_id}"
-
-        x1, y1, x2, y2 = self.bbox
-        center_x = ((x1 + x2) // 2) // 64
-        center_y = ((y1 + y2) // 2) // 64
-        return f"{self.class_name}:grid-{center_x}-{center_y}"
+        return f"{self.class_name}:untracked"
 
 
 @dataclass(frozen=True, slots=True)
