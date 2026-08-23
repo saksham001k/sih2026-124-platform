@@ -18,7 +18,7 @@ intelligence while transmitting evidence packets instead of continuous video.
 | False-alert suppression | Configurable N-of-M temporal confirmation, default 3/5 |
 | Spatial deduplication | Haversine-radius merge for repeat observations |
 | Evidence packaging | CSV events, context image, crop and metrics JSON |
-| Command centre | Streamlit GIS map, filters, evidence review and system metrics |
+| Command centre | One-upload Streamlit runner, GIS map, evidence review and system metrics |
 | Bandwidth proof | Measured full-video bytes versus generated evidence bytes |
 | ANPR | FastALPR ONNX pipeline with multi-frame tracking, GPS evidence and masked console output |
 | Traffic analytics | Pretrained COCO YOLO + ByteTrack ROI occupancy and bottleneck heuristics |
@@ -69,6 +69,28 @@ streamlit run dashboard.py
 ```
 
 Open the local URL printed by Streamlit, normally `http://localhost:8501`.
+
+## One-upload dashboard workflow
+
+The command centre can now create an isolated analysis session directly from a browser upload:
+
+1. Run `streamlit run dashboard.py`.
+2. Open **New scan** and drag in an MP4, MOV, AVI, or MKV dashcam clip.
+3. Select **Synthetic demo route** or upload a real GPS CSV.
+4. Choose **Quick scan** (road + traffic), **Full city scan** (road + traffic + ANPR),
+   or a custom module combination.
+5. Pass the displayed model/runtime preflight and click **Run DrishtiPath Scan**.
+6. Review every successful module in the result tabs. A failed module does not discard
+   evidence produced by the other modules.
+
+Dashboard runs are stored under `artifacts/ui_runs/<run-id>/` with safe generated input names,
+separate `road/`, `traffic/`, and `anpr/` outputs, and a `manifest.json` recording stage status.
+The entire `artifacts/` tree remains ignored by Git. Uploads are limited to 500 MB and the
+dashboard rejects unreadable videos and clips longer than 15 minutes.
+
+The bundled `gps_data.csv` is always labelled **synthetic_demo**. Selecting real telemetry
+requires a CSV with `timestamp` or `timestamp_s`, plus `lat`/`lon` or
+`latitude`/`longitude` columns.
 
 ## Use a road-hazard model
 
