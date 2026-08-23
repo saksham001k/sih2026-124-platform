@@ -18,7 +18,7 @@ intelligence while transmitting evidence packets instead of continuous video.
 | False-alert suppression | Configurable N-of-M temporal confirmation, default 3/5 |
 | Spatial deduplication | Haversine-radius merge for repeat observations |
 | Evidence packaging | CSV events, context image, crop and metrics JSON |
-| Command centre | One-upload Streamlit runner, GIS map, evidence review and system metrics |
+| Command centre | One-upload runner, unified 3D operational map, review timeline and evidence |
 | Bandwidth proof | Measured full-video bytes versus generated evidence bytes |
 | ANPR | FastALPR ONNX pipeline with multi-frame tracking, GPS evidence and masked console output |
 | Traffic analytics | Pretrained COCO YOLO + ByteTrack ROI occupancy and bottleneck heuristics |
@@ -91,6 +91,22 @@ dashboard rejects unreadable videos and clips longer than 15 minutes.
 The bundled `gps_data.csv` is always labelled **synthetic_demo**. Selecting real telemetry
 requires a CSV with `timestamp` or `timestamp_s`, plus `lat`/`lon` or
 `latitude`/`longitude` columns.
+
+### 3D operational command centre
+
+After a dashboard scan, open **3D command centre** for a unified digital-twin-style view:
+
+- cyan path — time-ordered bus GPS trajectory;
+- extruded amber/red columns — confirmed road hazards;
+- teal columns — traffic-window occupancy and vehicle-density intensity;
+- red alert markers — bottleneck episodes;
+- blue review markers — privacy-masked ANPR evidence.
+
+Column height is an operational intensity cue, **not physical object height**. The live renderer
+uses Carto basemap tiles and therefore benefits from internet access. Select
+**Offline-safe 3D** to use the tile-free Plotly renderer during unreliable venue connectivity.
+Both renderers use the same tested, normalized scene data. Complete plate text is never copied
+into the command-centre scene or timeline.
 
 ## Use a road-hazard model
 
