@@ -23,6 +23,10 @@ intelligence while transmitting evidence packets instead of continuous video.
 | ANPR | FastALPR ONNX pipeline with multi-frame tracking, GPS evidence and masked console output |
 | Traffic analytics | Pretrained COCO YOLO + ByteTrack ROI occupancy and bottleneck heuristics |
 | Edge export | NCNN/ONNX export with measured size and inference latency |
+| Urban assets | One low-rate visible-assets/waterlogging model plus GIS missing-asset review logic |
+| Safety candidates | Pedestrian conflict, rash-driving and suspected hit-and-run rules over existing tracks |
+| Live GPS and delivery | Serial NMEA adapter, disk outbox, authenticated retry and idempotent fleet ingestion |
+| Fleet intelligence | Cross-bus deficiency clusters, GeoJSON, mission OD matrix and dashboard tab |
 
 ## Architecture
 
@@ -77,14 +81,16 @@ The command centre can now create an isolated analysis session directly from a b
 1. Run `streamlit run dashboard.py`.
 2. Open **New scan** and drag in an MP4, MOV, AVI, or MKV dashcam clip.
 3. Select **Synthetic demo route** or upload a real GPS CSV.
-4. Choose **Quick scan** (road + traffic), **Full city scan** (road + traffic + ANPR),
+4. Choose **Quick scan** (road + traffic), **Full city scan**
+   (road + traffic + assets + ANPR),
    or a custom module combination.
 5. Pass the displayed model/runtime preflight and click **Run DrishtiPath Scan**.
 6. Review every successful module in the result tabs. A failed module does not discard
    evidence produced by the other modules.
 
 Dashboard runs are stored under `artifacts/ui_runs/<run-id>/` with safe generated input names,
-separate `road/`, `traffic/`, and `anpr/` outputs, and a `manifest.json` recording stage status.
+separate `road/`, `traffic/`, `assets/`, `incidents/`, and `anpr/` outputs, and a
+`manifest.json` recording stage status.
 The entire `artifacts/` tree remains ignored by Git. Uploads are limited to 500 MB and the
 dashboard rejects unreadable videos and clips longer than 15 minutes.
 
@@ -191,6 +197,35 @@ python orchestrator.py \
   --window-size 5 \
   --min-hits 3
 ```
+
+## Train and run the urban-assets model
+
+Prepare a licensed YOLO dataset with the seven class names in
+`config/urban_assets.data.example.yaml`. Train one small model—not one model per class:
+
+```bash
+python train_urban_assets.py \
+  --data datasets/urban_assets/data.yaml \
+  --model yolov8n.pt \
+  --epochs 80 \
+  --device 0
+```
+
+Run visible damage/waterlogging detection and optional GIS-based missing-asset inspection:
+
+```bash
+python asset_inspection.py \
+  --input clips/input_video.mp4 \
+  --gps gps_data.csv \
+  --gps-source-type synthetic_demo \
+  --model models/urban_assets.pt \
+  --inventory config/assets.example.json \
+  --output-dir artifacts/assets/latest
+```
+
+`missing_*` is never a detector class. It is emitted only after a camera-visible expected
+asset is traversed with enough sampled frames and insufficient presence evidence, and it
+always remains `pending_review`.
 
 ## ANPR incident review
 
@@ -383,8 +418,11 @@ Raspberry Pi camera example after confirming that the dashcam appears as `/dev/v
 ```bash
 python edge_agent.py \
   --source 0 \
-  --gps-csv route_gps.csv \
+  --gps-nmea-device /dev/ttyUSB0 \
   --gps-source-type real_telemetry \
+  --vehicle-id bus-042 \
+  --mission-id mission-20260823-am \
+  --route-id route-blue \
   --profile pi4 \
   --road-model models/road_hazards_ncnn_model \
   --traffic-model models/traffic_ncnn_model \
@@ -399,8 +437,35 @@ device-tree, and a computed single-worker load estimate. The dashboard **Live ed
 visualizes `device_status.json` and `metrics.json`.
 
 Confirmed road or asset detections enter an atomic disk-backed outbox. Loss of 4G does
-not discard evidence; network delivery and acknowledgement are intentionally a separate
-adapter. No continuous video upload is performed by this runtime.
+not discard evidence. `deliver_outbox.py` retries an authenticated endpoint and moves a
+packet to `sent/` only after a successful acknowledgement. No continuous video upload is
+performed by this runtime.
+
+### Central fleet ingestion and OD export
+
+```bash
+export DRISHTIPATH_INGEST_TOKEN='replace-with-a-long-random-token'
+python fleet_server.py --host 127.0.0.1 --port 8080
+
+python deliver_outbox.py \
+  --outbox artifacts/edge_live/pi-field-test/outbox \
+  --endpoint http://127.0.0.1:8080/v1/evidence
+
+python fleet_export.py
+```
+
+The export produces a fleet summary, deficiency clusters, GeoJSON events and an observed
+bus-mission OD matrix. It does not infer passenger origin–destination demand.
+
+### Physical field claim gate
+
+```bash
+python field_validate.py --mission-dir artifacts/edge_live/pi-field-test
+```
+
+Only an all-pass report on detected Raspberry Pi hardware with live serial NMEA, sufficient
+runtime/capture, successful analytics, no capture/model errors, and measured compute headroom
+sets `field_verified: true`.
 
 See [real-time edge deployment](docs/REALTIME_EDGE.md) for the scheduling contract,
 dashcam checks, geofence format, artifacts, and honest claim boundary.
@@ -434,14 +499,15 @@ push and pull request.
 - Included GPS is synthetic and is clearly labelled as demo data.
 - Standard `yolov8n.pt` demonstrates traffic objects, not road-condition classes.
 - Raspberry Pi performance has not been claimed until the target-device report is saved.
-- Live serial/NMEA GPS and remote outbox delivery adapters are not yet implemented; the
-  live agent currently accepts timestamped GPS CSV replay or an explicitly labelled fixed
-  demo coordinate.
-- Real-time ANPR remains trigger-adapter work; the existing reviewed FastALPR pipeline is
-  available for uploaded or retained incident clips.
-- Hit-and-run classification is not inferred merely from a detected vehicle.
+- Urban-assets dataset preparation follows standard YOLO layout, but validated India-relevant
+  `models/urban_assets.pt` weights are not included.
+- Live serial/NMEA GPS, authenticated delivery, and central fleet ingestion are implemented;
+  a physical Pi/camera/GPS field report is still required before making a hardware claim.
+- ANPR is an event/review workload rather than a fourth always-on resident model.
+- Hit-and-run and rash-driving outputs are human-review candidates, not legal conclusions.
 - Number plates and faces must follow authorization, retention and access-control policies.
-- Origin–destination analytics requires multiple vehicles, route IDs and a larger dataset.
+- Origin–destination output describes observed bus missions, not passenger journeys.
 
 See [architecture details](docs/ARCHITECTURE.md) and the
-[evaluation checklist](docs/EVALUATION.md).
+[evaluation checklist](docs/EVALUATION.md). The full claim matrix is in
+[problem-statement coverage](docs/PROBLEM_STATEMENT_COVERAGE.md).

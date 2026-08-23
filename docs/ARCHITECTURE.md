@@ -5,7 +5,8 @@
 1. **Edge:** dashcam frames are sampled, inferred and tracked locally.
 2. **Ingestion:** every processed frame is aligned to GPS by video timestamp.
 3. **Intelligence:** temporal confirmation and spatial deduplication produce events.
-4. **Command:** compact evidence packets are reviewed on a GIS dashboard.
+4. **Command:** authenticated fleet ingestion deduplicates events, exports GIS/OD products,
+   and serves review artifacts to the dashboard.
 
 ## Live edge scheduling
 
@@ -39,6 +40,7 @@ the next cloud/API milestone.
 | Field | Meaning |
 |---|---|
 | `event_id` | Unique evidence identifier |
+| `vehicle_id`, `mission_id`, `route_id` | Fleet and observed-route identity |
 | `class` | Model class label |
 | `confidence` | Mean confidence across confirming observations |
 | `video_time_s` | Time relative to the start of the source video |
@@ -53,3 +55,17 @@ the next cloud/API milestone.
 
 Never label a generic object detection as a pothole or incident. The model class map and
 validation report must travel with every deployed model version.
+
+## Central evidence flow
+
+```mermaid
+flowchart TD
+    A["Edge evidence outbox"] --> B["Authenticated retry client"]
+    B --> C["Idempotent fleet ingestion"]
+    C --> D["SQLite event and mission store"]
+    D --> E["GIS, deficiency and OD exports"]
+```
+
+The API accepts the same event at most once per vehicle and event ID. Failed uploads remain
+in the pending outbox; credentials come from the environment and are never written into
+mission reports.

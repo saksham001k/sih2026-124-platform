@@ -6,3 +6,4 @@ folium>=0.15,<1
 streamlit>=1.51,<2
 streamlit-folium>=0.20,<1
 plotly>=5.18,<7
+pyserial>=3.5,<4

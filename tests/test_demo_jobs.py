@@ -8,6 +8,7 @@ from urban_intelligence.demo_jobs import (
     AnalysisRequest,
     UploadValidationError,
     VideoMetadata,
+    correlate_incidents,
     generate_run_id,
     list_completed_runs,
     load_manifest,
@@ -36,8 +37,49 @@ def gps_payload() -> bytes:
 
 def test_scan_profiles_are_stable_and_custom_is_ordered() -> None:
     assert modules_for_profile("quick") == ("road", "traffic")
-    assert modules_for_profile("full") == ("road", "traffic", "anpr")
+    assert modules_for_profile("full") == ("road", "traffic", "assets", "anpr")
     assert modules_for_profile("custom", ("anpr", "road")) == ("road", "anpr")
+
+
+def test_incident_correlation_links_masked_anpr_only(tmp_path: Path) -> None:
+    traffic = tmp_path / "traffic"
+    anpr = tmp_path / "anpr"
+    traffic.mkdir()
+    anpr.mkdir()
+    (traffic / "safety_events.json").write_text(
+        json.dumps(
+            [
+                {
+                    "event_id": "safety-1",
+                    "event_type": "suspected_hit_and_run",
+                    "video_time_s": 10,
+                    "lat": 28.6,
+                    "lon": 77.2,
+                }
+            ]
+        ),
+        encoding="utf-8",
+    )
+    (anpr / "anpr_events.json").write_text(
+        json.dumps(
+            [
+                {
+                    "event_id": "anpr-1",
+                    "video_time_s": 11,
+                    "lat": 28.6,
+                    "lon": 77.2,
+                    "masked_plate": "KA*****65",
+                    "plate_text": "MUST-NOT-COPY",
+                }
+            ]
+        ),
+        encoding="utf-8",
+    )
+    summary = correlate_incidents(tmp_path)
+    records = json.loads((tmp_path / "incidents/incidents.json").read_text())
+    assert summary["anpr_candidates_linked"] == 1
+    assert records[0]["masked_plate"] == "KA*****65"
+    assert "plate_text" not in records[0]
 
 
 def test_custom_profile_rejects_empty_and_unknown_modules() -> None:

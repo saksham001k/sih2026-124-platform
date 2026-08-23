@@ -1,0 +1,22 @@
+[
+  {
+    "asset_id": "crossing-school-001",
+    "asset_type": "zebra_crossing",
+    "latitude": 28.6139,
+    "longitude": 77.209,
+    "inspection_radius_m": 22,
+    "camera_visible": true,
+    "min_sampled_frames": 5,
+    "min_visual_hits": 2
+  },
+  {
+    "asset_id": "sign-route-001",
+    "asset_type": "traffic_signboard",
+    "latitude": 28.6142,
+    "longitude": 77.2094,
+    "inspection_radius_m": 25,
+    "camera_visible": false,
+    "min_sampled_frames": 5,
+    "min_visual_hits": 2
+  }
+]

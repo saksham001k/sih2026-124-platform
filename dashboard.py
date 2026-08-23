@@ -353,8 +353,16 @@ def load_operational_scene(
     road_dir: Path,
     traffic_dir: Path,
     anpr_dir: Path,
+    assets_dir: Path | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     road_events = load_csv(str(road_dir / "events.csv"))
+    if assets_dir is not None:
+        asset_value = load_json(str(assets_dir / "asset_events.json"))
+        asset_events = asset_value if isinstance(asset_value, list) else []
+        if asset_events:
+            road_events = pd.concat(
+                [road_events, pd.DataFrame(asset_events)], ignore_index=True
+            )
     traffic_windows = load_csv(str(traffic_dir / "traffic_timeseries.csv"))
     bottlenecks = load_csv(str(traffic_dir / "bottleneck_events.csv"))
     anpr_value = load_json(str(anpr_dir / "anpr_events.json"))
@@ -498,7 +506,7 @@ def render_road_hazard_section(
             '<span class="status-pill">● Edge pipeline online</span>',
             unsafe_allow_html=True,
         )
-        st_folium(build_event_map(filtered_events), height=560, use_container_width=True)
+        st_folium(build_event_map(filtered_events), height=560, width=None)
         if not filtered_events.empty:
             display_columns = [
                 column
@@ -576,6 +584,8 @@ def render_traffic_section(artifacts_dir: Path) -> None:
     summary = load_json(str(artifacts_dir / "traffic_summary.json"))
     timeseries = load_csv(str(artifacts_dir / "traffic_timeseries.csv"))
     bottlenecks = load_csv(str(artifacts_dir / "bottleneck_events.csv"))
+    safety_value = load_json(str(artifacts_dir / "safety_events.json"))
+    safety_events = safety_value if isinstance(safety_value, list) else []
 
     if not summary and timeseries.empty and bottlenecks.empty:
         st.info(
@@ -664,11 +674,163 @@ def render_traffic_section(artifacts_dir: Path) -> None:
         st_folium(
             build_bottleneck_map(bottlenecks, gps_source_type),
             height=420,
-            use_container_width=True,
+            width=None,
         )
 
     with st.expander("Traffic summary JSON"):
         st.json(summary)
+
+    st.subheader("Vulnerable-road-user & driving review")
+    st.caption(
+        "Candidates reuse tracked traffic detections. School-child identity, legal speed, "
+        "collision certainty, and driver intent are never inferred automatically."
+    )
+    if safety_events:
+        safe_frame = pd.DataFrame(safety_events)
+        visible = [
+            column
+            for column in (
+                "event_id",
+                "event_type",
+                "subtype",
+                "video_time_s",
+                "severity",
+                "school_zone_context",
+                "status",
+            )
+            if column in safe_frame.columns
+        ]
+        st.dataframe(safe_frame[visible], hide_index=True, width="stretch")
+    else:
+        st.info("No safety candidate crossed the configured image-space review gate.")
+
+
+def render_asset_section(artifacts_dir: Path) -> None:
+    metrics = load_json(str(artifacts_dir / "metrics.json"))
+    value = load_json(str(artifacts_dir / "asset_events.json"))
+    events = value if isinstance(value, list) else []
+    detections = load_csv(str(artifacts_dir / "asset_detections.csv"))
+    if not metrics and not events and detections.empty:
+        st.info("No urban-assets scan is available for this mission.")
+        return
+    columns = st.columns(4)
+    columns[0].metric("Review events", len(events))
+    columns[1].metric("Visual detections", int(metrics.get("visual_detections", 0)))
+    columns[2].metric("Inventory assets", int(metrics.get("inventory_assets", 0)))
+    columns[3].metric("Edge FPS", f"{float(metrics.get('end_to_end_fps', 0)):.1f}")
+    st.warning(
+        "A missing-asset result is an inventory-based absence candidate, never a learned "
+        "'missing object' box. It requires camera-visible inventory metadata and human review."
+    )
+    if events:
+        frame = pd.DataFrame(events)
+        visible = [
+            column
+            for column in (
+                "event_id",
+                "event_type",
+                "class",
+                "confidence",
+                "sampled_frames",
+                "visual_hits",
+                "lat",
+                "lon",
+                "status",
+            )
+            if column in frame.columns
+        ]
+        st.dataframe(frame[visible], hide_index=True, width="stretch")
+        map_rows = frame.copy()
+        if "confidence" not in map_rows:
+            map_rows["confidence"] = map_rows.get("evidence_strength", 0.5)
+        st_folium(build_event_map(map_rows), height=460, width=None)
+    else:
+        st.info("No temporally confirmed asset event requires review.")
+    annotated = artifacts_dir / "assets_annotated.mp4"
+    if annotated.is_file():
+        with st.expander("Play annotated urban-assets video"):
+            st.video(str(annotated))
+
+
+def render_incident_section(run_dir: Path | None) -> None:
+    if run_dir is None:
+        st.info("Select a completed one-upload mission to review incident correlation.")
+        return
+    value = load_json(str(run_dir / "incidents" / "incidents.json"))
+    incidents = value if isinstance(value, list) else []
+    if not incidents:
+        st.info("No safety candidate was available for ANPR correlation.")
+        return
+    frame = pd.DataFrame(incidents)
+    forbidden = {"plate", "plate_text", "normalized_plate", "full_plate", "ocr_text"}
+    safe_columns = [column for column in frame.columns if column not in forbidden]
+    linked = int(
+        (frame["anpr_link_status"] == "candidate_pending_review").sum()
+        if "anpr_link_status" in frame
+        else 0
+    )
+    columns = st.columns(3)
+    columns[0].metric("Incident candidates", len(frame))
+    columns[1].metric("Masked ANPR links", linked)
+    columns[2].metric("Human review", len(frame))
+    st.error(
+        "Hit-and-run and rash-driving outputs are investigative candidates—not legal "
+        "findings. Plate text remains masked in the command centre."
+    )
+    st.dataframe(frame[safe_columns], hide_index=True, width="stretch")
+
+
+def render_fleet_section(export_dir: Path) -> None:
+    summary = load_json(str(export_dir / "fleet_summary.json"))
+    clusters_value = load_json(str(export_dir / "deficiency_clusters.json"))
+    clusters = clusters_value if isinstance(clusters_value, list) else []
+    od = load_csv(str(export_dir / "od_matrix.csv"))
+    if not summary:
+        st.info(
+            "No central fleet export found. Start `fleet_server.py`, deliver edge outboxes, "
+            "then run `python fleet_export.py`."
+        )
+        return
+    columns = st.columns(6)
+    columns[0].metric("Fleet vehicles", int(summary.get("vehicle_count", 0)))
+    columns[1].metric("Missions", int(summary.get("mission_count", 0)))
+    columns[2].metric("Events", int(summary.get("event_count", 0)))
+    columns[3].metric("Deficiency clusters", int(summary.get("deficiency_cluster_count", 0)))
+    columns[4].metric("OD pairs", int(summary.get("od_pair_count", 0)))
+    columns[5].metric("Review queue", int(summary.get("pending_review", 0)))
+    st.caption(
+        "Repeated sightings within the configured radius are grouped across buses. "
+        "OD rows represent observed bus missions—not inferred passenger journeys."
+    )
+    left, right = st.columns([1.25, 1])
+    with left:
+        st.subheader("Infrastructure deficiency map")
+        if clusters:
+            cluster_frame = pd.DataFrame(clusters)
+            st.map(cluster_frame, latitude="latitude", longitude="longitude")
+            visible = [
+                column
+                for column in (
+                    "cluster_id",
+                    "class",
+                    "sightings",
+                    "unique_vehicles",
+                    "latitude",
+                    "longitude",
+                )
+                if column in cluster_frame.columns
+            ]
+            st.dataframe(cluster_frame[visible], hide_index=True, width="stretch")
+        else:
+            st.info("No deficiency cluster is available.")
+    with right:
+        st.subheader("Observed mission OD matrix")
+        if not od.empty:
+            st.dataframe(od, hide_index=True, width="stretch")
+        else:
+            st.info("No origin–destination pair is available.")
+        with st.expander("Fleet summary JSON"):
+            st.json(summary)
 
 
 def render_edge_benchmark_section(report_path: Path) -> None:
@@ -1084,6 +1246,7 @@ def render_command_center(
     road_dir: Path,
     traffic_dir: Path,
     anpr_dir: Path,
+    assets_dir: Path,
     manifest: dict[str, Any],
 ) -> None:
     scene, traffic_summary = load_operational_scene(
@@ -1091,6 +1254,7 @@ def render_command_center(
         road_dir=road_dir,
         traffic_dir=traffic_dir,
         anpr_dir=anpr_dir,
+        assets_dir=assets_dir,
     )
     road_metrics = load_json(str(road_dir / "metrics.json"))
     road_metrics = road_metrics if isinstance(road_metrics, dict) else {}
@@ -1201,7 +1365,7 @@ def render_scan_launcher(runs_root: Path) -> Path | None:
         profile_label = st.radio(
             "Scan mode",
             ["Quick scan", "Full city scan", "Custom scan"],
-            help="Quick: road + traffic. Full: road + traffic + ANPR.",
+            help="Quick: road + traffic. Full: road + traffic + assets + ANPR.",
         )
         profile = {
             "Quick scan": "quick",
@@ -1211,6 +1375,7 @@ def render_scan_launcher(runs_root: Path) -> Path | None:
         module_labels = {
             "Road hazards": "road",
             "Traffic analytics": "traffic",
+            "Urban assets & waterlogging": "assets",
             "ANPR evidence": "anpr",
         }
         custom_values: tuple[str, ...] = ()
@@ -1230,6 +1395,23 @@ def render_scan_launcher(runs_root: Path) -> Path | None:
         with st.expander("Model settings", expanded=False):
             road_model = st.text_input("Road-hazard model", "models/road_hazards.pt")
             traffic_model = st.text_input("Traffic model", "yolov8n.pt")
+            asset_model = st.text_input("Urban-assets model", "models/urban_assets.pt")
+            asset_inventory = st.file_uploader(
+                "Optional asset inventory JSON",
+                type=["json"],
+                help=(
+                    "Required only for missing-divider/crossing/sign candidates. "
+                    "Waterlogging and visible damage do not require inventory."
+                ),
+            )
+            school_zones = st.file_uploader(
+                "Optional school-zone geofences JSON",
+                type=["json"],
+                help=(
+                    "Adds school-zone context to person/vehicle crossing conflicts. "
+                    "It never infers a person's age."
+                ),
+            )
 
     st.subheader("Preflight")
     checks = (
@@ -1237,6 +1419,7 @@ def render_scan_launcher(runs_root: Path) -> Path | None:
             modules,
             road_model=road_model,
             traffic_model=traffic_model,
+            asset_model=asset_model,
         )
         if modules
         else {}
@@ -1292,6 +1475,19 @@ def render_scan_launcher(runs_root: Path) -> Path | None:
             original_gps_name=gps_upload.name if gps_upload is not None else "gps.csv",
             road_model=road_model,
             traffic_model=traffic_model,
+            asset_model=asset_model,
+            asset_inventory_payload=(
+                asset_inventory.getbuffer() if asset_inventory is not None else None
+            ),
+            original_asset_inventory_name=(
+                asset_inventory.name if asset_inventory is not None else "assets.json"
+            ),
+            school_zones_payload=(
+                school_zones.getbuffer() if school_zones is not None else None
+            ),
+            original_school_zones_name=(
+                school_zones.name if school_zones is not None else "school_zones.json"
+            ),
         )
         manifest = run_analysis(request, progress=update_progress)
     except (UploadValidationError, ValueError, FileNotFoundError, OSError) as exc:
@@ -1338,18 +1534,36 @@ def main() -> None:
             "Live edge mission",
             "artifacts/edge_live/latest",
         )
+        fleet_export_value = st.text_input(
+            "Fleet export",
+            "artifacts/fleet/export",
+        )
     if st.sidebar.button("Refresh data", width="stretch"):
         st.cache_data.clear()
         st.rerun()
 
     edge_report_path = Path(edge_report_value)
 
-    scan_tab, command_tab, road_tab, traffic_tab, anpr_tab, edge_tab, live_edge_tab = st.tabs(
+    (
+        scan_tab,
+        command_tab,
+        road_tab,
+        traffic_tab,
+        assets_tab,
+        incident_tab,
+        fleet_tab,
+        anpr_tab,
+        edge_tab,
+        live_edge_tab,
+    ) = st.tabs(
         [
             "New scan",
             "3D command centre",
             "Road hazards",
             "Traffic analytics",
+            "Urban assets",
+            "Safety & incidents",
+            "Fleet intelligence",
             "ANPR review",
             "Edge benchmark",
             "Live edge",
@@ -1365,6 +1579,7 @@ def main() -> None:
     road_dir = active_run / "road" if active_run else Path(artifacts_value)
     traffic_dir = active_run / "traffic" if active_run else Path(artifacts_value)
     anpr_dir = active_run / "anpr" if active_run else Path(artifacts_value)
+    assets_dir = active_run / "assets" if active_run else Path(artifacts_value)
     manifest = load_manifest(active_run) if active_run else {}
 
     with command_tab:
@@ -1374,6 +1589,7 @@ def main() -> None:
                 road_dir=road_dir,
                 traffic_dir=traffic_dir,
                 anpr_dir=anpr_dir,
+                assets_dir=assets_dir,
                 manifest=manifest,
             )
         else:
@@ -1400,6 +1616,12 @@ def main() -> None:
         )
     with traffic_tab:
         render_traffic_section(traffic_dir)
+    with assets_tab:
+        render_asset_section(assets_dir)
+    with incident_tab:
+        render_incident_section(active_run)
+    with fleet_tab:
+        render_fleet_section(Path(fleet_export_value))
     with anpr_tab:
         stage = manifest.get("stages", {}).get("anpr") if manifest else None
         render_anpr_section(anpr_dir, stage)
