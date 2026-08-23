@@ -21,6 +21,7 @@ intelligence while transmitting evidence packets instead of continuous video.
 | Command centre | Streamlit GIS map, filters, evidence review and system metrics |
 | Bandwidth proof | Measured full-video bytes versus generated evidence bytes |
 | ANPR | FastALPR ONNX pipeline with multi-frame tracking, GPS evidence and masked console output |
+| Traffic analytics | Pretrained COCO YOLO + ByteTrack ROI occupancy and bottleneck heuristics |
 | Edge export | NCNN/ONNX export with measured size and inference latency |
 
 ## Architecture
@@ -215,6 +216,63 @@ becomes a confirmed event (raw observations may still appear in the CSV).
 - Console output masks plates by default.
 - Do not commit clips, ONNX weights, artifacts, or plate evidence to Git.
 - Do not transmit evidence automatically from this CLI.
+
+## Traffic analytics
+
+DrishtiPath can run a separate **pretrained COCO** traffic pass with Ultralytics YOLO and
+ByteTrack. This module is independent of the road-hazard model and does not claim school-child
+detection, calibrated road occupancy, or km/h speed estimates.
+
+### Run
+
+```bash
+python traffic_analytics.py \
+  --input clips/input_video.mp4 \
+  --gps gps_data.csv \
+  --gps-source-type synthetic_demo \
+  --model yolov8n.pt \
+  --output-dir artifacts/traffic_input_video \
+  --confidence 0.25 \
+  --frame-skip 3 \
+  --window-seconds 5 \
+  --roi 0.0,0.30,1.0,1.0 \
+  --congestion-min-vehicles 6 \
+  --congestion-min-occupancy 0.18 \
+  --congestion-consecutive-windows 3
+```
+
+Supported vehicle classes: `car`, `motorcycle`, `bus`, `truck`, `bicycle`.
+Person detections may be recorded separately. Set `--gps-source-type` explicitly to
+`synthetic_demo`, `real_telemetry`, or `unknown`.
+
+### Outputs
+
+- `traffic_timeseries.csv` — fixed windows with mean/peak counts, occupancy, unique entries, GPS
+- `traffic_summary.json` — configuration, totals, latency and documented limitations
+- `bottleneck_events.csv` — congestion episodes with `status: pending_review` and
+  `method: configurable_roi_heuristic`
+- `traffic_detections.csv` — compact ROI detections for review
+- `traffic_annotated.mp4` — ROI, boxes, track IDs, occupancy and congestion overlay
+
+### Dashboard
+
+```bash
+streamlit run dashboard.py
+```
+
+Open the **Traffic analytics** tab and point the sidebar at the traffic output directory.
+If artifacts are missing, the tab shows run instructions instead of failing. Synthetic GPS is
+labelled clearly when `gps_source_type` is `synthetic_demo`.
+
+### Limitations
+
+- COCO provides generic vehicle/person classes only; it does **not** identify school children.
+- ROI occupancy is an image-space proxy (clipped box area / ROI area), not real road occupancy.
+- Unique counts depend on ByteTrack continuity and ignore untracked detections.
+- Bottleneck detection is a configurable prototype heuristic, not a municipal traffic standard.
+- Bundled `gps_data.csv` is synthetic demo data unless labelled otherwise via CLI.
+- Real deployment needs camera calibration, real bus GPS and field validation.
+- Do not estimate vehicle speed in km/h from pixels without calibration and reliable GPS speed.
 
 ## Edge model export
 

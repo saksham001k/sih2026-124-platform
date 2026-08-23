@@ -109,6 +109,29 @@ def build_event_map(events: pd.DataFrame) -> folium.Map:
     return event_map
 
 
+def build_bottleneck_map(events: pd.DataFrame, gps_source_type: str) -> folium.Map:
+    center = [28.6139, 77.2090]
+    lat_col = "latitude" if "latitude" in events.columns else "lat"
+    lon_col = "longitude" if "longitude" in events.columns else "lon"
+    if not events.empty:
+        center = [float(events[lat_col].mean()), float(events[lon_col].mean())]
+    event_map = folium.Map(location=center, zoom_start=15, control_scale=True)
+    for _, row in events.iterrows():
+        popup = (
+            f"<b>{row.get('event_id', 'bottleneck')}</b><br>"
+            f"Vehicles: {float(row.get('mean_vehicle_count', 0)):.1f}<br>"
+            f"Occupancy: {float(row.get('mean_occupancy', 0)):.2f}<br>"
+            f"Status: {row.get('status', 'pending_review')}<br>"
+            f"GPS type: {gps_source_type}"
+        )
+        folium.Marker(
+            [float(row[lat_col]), float(row[lon_col])],
+            popup=popup,
+            icon=folium.Icon(color="red", icon="warning-sign"),
+        ).add_to(event_map)
+    return event_map
+
+
 def resolve_evidence(path_value: object, artifacts_dir: Path) -> Path | None:
     if not isinstance(path_value, str) or not path_value:
         return None
@@ -119,24 +142,20 @@ def resolve_evidence(path_value: object, artifacts_dir: Path) -> Path | None:
     return evidence_relative if evidence_relative.is_file() else None
 
 
-def main() -> None:
-    st.title("DrishtiPath Urban Intelligence Command Centre")
-    st.caption("Fleet-scale road and traffic evidence · Edge verified · Bandwidth aware")
-
-    artifacts_value = st.sidebar.text_input("Artifacts directory", "artifacts/latest")
-    artifacts_dir = Path(artifacts_value)
-    if st.sidebar.button("Refresh data", use_container_width=True):
-        st.cache_data.clear()
-        st.rerun()
-
-    events = load_csv(str(artifacts_dir / "events.csv"))
-    detections = load_csv(str(artifacts_dir / "detections.csv"))
-    metrics = load_json(str(artifacts_dir / "metrics.json"))
-    bandwidth = load_json(str(artifacts_dir / "bandwidth_report.json"))
-
+def render_road_hazard_section(
+    *,
+    artifacts_dir: Path,
+    events: pd.DataFrame,
+    detections: pd.DataFrame,
+    metrics: dict,
+    bandwidth: dict,
+) -> None:
     if events.empty and detections.empty:
-        st.info("No processed events yet. Run `python orchestrator.py` and refresh this page.")
-        st.stop()
+        st.info(
+            "No road-hazard artifacts in this directory. Run `python orchestrator.py` "
+            "and point the sidebar at `artifacts/latest`."
+        )
+        return
 
     if not events.empty:
         events = events.copy()
@@ -241,6 +260,136 @@ def main() -> None:
                 st.json(bandwidth)
             else:
                 st.info("Run `python bandwidth_demo.py` to populate transfer metrics.")
+
+
+def render_traffic_section(artifacts_dir: Path) -> None:
+    summary = load_json(str(artifacts_dir / "traffic_summary.json"))
+    timeseries = load_csv(str(artifacts_dir / "traffic_timeseries.csv"))
+    bottlenecks = load_csv(str(artifacts_dir / "bottleneck_events.csv"))
+
+    if not summary and timeseries.empty and bottlenecks.empty:
+        st.info(
+            "No traffic analytics artifacts found. Run:\n\n"
+            "```bash\n"
+            "python traffic_analytics.py \\\n"
+            "  --input clips/input_video.mp4 \\\n"
+            "  --gps gps_data.csv \\\n"
+            "  --gps-source-type synthetic_demo \\\n"
+            "  --output-dir artifacts/traffic_input_video\n"
+            "```\n\n"
+            "Then point the sidebar at that output directory."
+        )
+        return
+
+    gps_source_type = str(summary.get("gps_source_type", "unknown"))
+    if gps_source_type == "synthetic_demo":
+        st.warning(
+            "GPS provenance is labelled **synthetic_demo**. Coordinates are demo "
+            "interpolation, not claimed real bus telemetry."
+        )
+
+    totals = summary.get("totals_by_class", {})
+    row_one = st.columns(3)
+    row_one[0].metric(
+        "Unique tracked vehicles", int(summary.get("total_unique_tracked_vehicles", 0))
+    )
+    row_one[1].metric(
+        "Current ROI vehicles", int(summary.get("current_vehicle_count", 0))
+    )
+    row_one[2].metric(
+        "Peak ROI vehicles", int(summary.get("max_vehicle_count", 0))
+    )
+    row_two = st.columns(3)
+    row_two[0].metric(
+        "Mean occupancy",
+        f"{float(summary.get('average_occupancy', 0)) * 100:.1f}%",
+        help="Image-space proxy across processed frames",
+    )
+    row_two[1].metric(
+        "Peak occupancy", f"{float(summary.get('max_occupancy', 0)) * 100:.1f}%"
+    )
+    row_two[2].metric(
+        "Bottleneck events", int(summary.get("bottleneck_event_count", len(bottlenecks)))
+    )
+
+    st.caption(
+        "ROI occupancy is an image-space proxy. Bottleneck detection is a configurable "
+        "prototype heuristic (`configurable_roi_heuristic`), not a calibrated municipal standard. "
+        "COCO does not identify school children."
+    )
+
+    if totals:
+        class_df = pd.DataFrame(
+            {"class": list(totals.keys()), "unique_vehicles": list(totals.values())}
+        ).set_index("class")
+        st.subheader("Unique vehicles by class")
+        st.bar_chart(class_df)
+
+    left, right = st.columns(2)
+    with left:
+        st.subheader("Vehicle count timeline")
+        if not timeseries.empty and "mean_vehicle_count" in timeseries.columns:
+            chart = timeseries.set_index("midpoint_time_s")[["mean_vehicle_count"]]
+            st.line_chart(chart)
+        else:
+            st.info("No traffic timeseries available.")
+    with right:
+        st.subheader("ROI occupancy timeline")
+        if not timeseries.empty and "mean_occupancy" in timeseries.columns:
+            chart = timeseries.set_index("midpoint_time_s")[["mean_occupancy"]]
+            st.line_chart(chart)
+        else:
+            st.info("No occupancy timeseries available.")
+
+    st.subheader("Bottleneck events")
+    if bottlenecks.empty:
+        st.info("No bottleneck events were emitted for these settings.")
+    else:
+        st.dataframe(bottlenecks, hide_index=True, use_container_width=True)
+        st_folium(
+            build_bottleneck_map(bottlenecks, gps_source_type),
+            height=420,
+            use_container_width=True,
+        )
+
+    with st.expander("Traffic summary JSON"):
+        st.json(summary)
+
+
+def main() -> None:
+    st.title("DrishtiPath Urban Intelligence Command Centre")
+    st.caption("Fleet-scale road and traffic evidence · Edge verified · Bandwidth aware")
+
+    artifacts_value = st.sidebar.text_input("Artifacts directory", "artifacts/latest")
+    artifacts_dir = Path(artifacts_value)
+    if st.sidebar.button("Refresh data", use_container_width=True):
+        st.cache_data.clear()
+        st.rerun()
+
+    events = load_csv(str(artifacts_dir / "events.csv"))
+    detections = load_csv(str(artifacts_dir / "detections.csv"))
+    metrics = load_json(str(artifacts_dir / "metrics.json"))
+    bandwidth = load_json(str(artifacts_dir / "bandwidth_report.json"))
+    has_traffic = (artifacts_dir / "traffic_summary.json").is_file() or (
+        artifacts_dir / "traffic_timeseries.csv"
+    ).is_file()
+
+    road_tab, traffic_tab = st.tabs(["Road hazards", "Traffic analytics"])
+    with road_tab:
+        render_road_hazard_section(
+            artifacts_dir=artifacts_dir,
+            events=events,
+            detections=detections,
+            metrics=metrics,
+            bandwidth=bandwidth,
+        )
+    with traffic_tab:
+        if not has_traffic and artifacts_value == "artifacts/latest":
+            st.caption(
+                "Tip: traffic outputs are usually under a dedicated directory such as "
+                "`artifacts/traffic_input_video`."
+            )
+        render_traffic_section(artifacts_dir)
 
 
 if __name__ == "__main__":
