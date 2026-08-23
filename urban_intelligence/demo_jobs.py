@@ -21,6 +21,35 @@ SCAN_PROFILES: dict[str, tuple[str, ...]] = {
     "quick": ("road", "traffic"),
     "full": SUPPORTED_MODULES,
 }
+QUALITY_PROFILES: dict[str, dict[str, Any]] = {
+    "high_recall": {
+        "label": "High recall",
+        "road_confidence": 0.05,
+        "road_image_size": 768,
+        "road_augment": True,
+        "road_window_size": 7,
+        "road_min_hits": 2,
+        "road_roi_top": 0.25,
+    },
+    "balanced": {
+        "label": "Balanced",
+        "road_confidence": 0.10,
+        "road_image_size": 704,
+        "road_augment": False,
+        "road_window_size": 5,
+        "road_min_hits": 3,
+        "road_roi_top": 0.30,
+    },
+    "strict": {
+        "label": "Strict review",
+        "road_confidence": 0.20,
+        "road_image_size": 640,
+        "road_augment": False,
+        "road_window_size": 5,
+        "road_min_hits": 3,
+        "road_roi_top": 0.32,
+    },
+}
 MAX_UPLOAD_BYTES = 500 * 1024 * 1024
 MAX_VIDEO_DURATION_S = 15 * 60
 SAFE_RUN_ID_PATTERN = re.compile(r"^run-[A-Za-z0-9-]+$")
@@ -51,6 +80,7 @@ class AnalysisRequest:
     gps_source_type: str
     modules: tuple[str, ...]
     scan_profile: str
+    quality_profile: str = "high_recall"
     road_model: str = "models/road_hazards.pt"
     traffic_model: str = "yolov8n.pt"
     asset_model: str = "models/urban_assets.pt"
@@ -71,6 +101,15 @@ def modules_for_profile(profile: str, custom_modules: tuple[str, ...] = ()) -> t
     if not selected:
         raise ValueError("custom scan requires at least one module")
     return selected
+
+
+def quality_profile_settings(profile: str) -> dict[str, Any]:
+    """Return an isolated copy of one documented inference policy."""
+    if profile not in QUALITY_PROFILES:
+        raise ValueError(
+            f"quality profile must be one of: {', '.join(QUALITY_PROFILES)}"
+        )
+    return dict(QUALITY_PROFILES[profile])
 
 
 def generate_run_id(now: datetime | None = None, token: str | None = None) -> str:
@@ -182,6 +221,7 @@ def prepare_run(
     gps_source_type: str,
     modules: tuple[str, ...],
     scan_profile: str,
+    quality_profile: str = "high_recall",
     gps_payload: bytes | bytearray | memoryview | None = None,
     original_gps_name: str = "gps.csv",
     synthetic_gps_path: Path = Path("gps_data.csv"),
@@ -201,6 +241,7 @@ def prepare_run(
         raise ValueError("modules must contain one or more supported analysis modules")
     if gps_source_type not in {"synthetic_demo", "real_telemetry"}:
         raise ValueError("gps_source_type must be synthetic_demo or real_telemetry")
+    quality_profile_settings(quality_profile)
 
     video_extension = validate_upload(
         original_video_name,
@@ -280,6 +321,7 @@ def prepare_run(
             gps_source_type=gps_source_type,
             modules=tuple(module for module in SUPPORTED_MODULES if module in modules),
             scan_profile=scan_profile,
+            quality_profile=quality_profile,
             road_model=road_model,
             traffic_model=traffic_model,
             asset_model=asset_model,
@@ -292,6 +334,7 @@ def prepare_run(
             "created_at": datetime.now(UTC).isoformat(),
             "status": "ready",
             "scan_profile": scan_profile,
+            "quality_profile": quality_profile,
             "requested_modules": list(request.modules),
             "gps_source_type": gps_source_type,
             "warnings": warnings,
@@ -421,17 +464,24 @@ def preflight_checks(
 def _road_runner(request: AnalysisRequest) -> Mapping[str, Any]:
     from orchestrator import run_pipeline
 
+    quality = quality_profile_settings(request.quality_profile)
+
     return run_pipeline(
         input_path=request.input_path,
         gps_path=request.gps_path,
         output_dir=request.run_dir / "road",
         model_path=request.road_model,
-        confidence=0.10,
+        confidence=float(quality["road_confidence"]),
         frame_skip=1,
-        window_size=5,
-        min_hits=3,
+        window_size=int(quality["road_window_size"]),
+        min_hits=int(quality["road_min_hits"]),
         dedupe_radius_m=12.0,
         classes="pothole,longitudinal_crack,transverse_crack,alligator_crack",
+        image_size=int(quality["road_image_size"]),
+        inference_iou=0.70,
+        augment=bool(quality["road_augment"]),
+        road_roi_top=float(quality["road_roi_top"]),
+        quality_profile=request.quality_profile,
     )
 
 
@@ -466,7 +516,7 @@ def _anpr_runner(request: AnalysisRequest) -> Mapping[str, Any]:
         create_alpr_engine,
         run_pipeline,
     )
-    detector_confidence = 0.20
+    detector_confidence = 0.35
     predict_fn = create_alpr_engine(
         detector_model=DEFAULT_DETECTOR_MODEL,
         ocr_model=DEFAULT_OCR_MODEL,
@@ -480,12 +530,14 @@ def _anpr_runner(request: AnalysisRequest) -> Mapping[str, Any]:
         predict_fn=predict_fn,
         detector_confidence=detector_confidence,
         sample_fps=5.0,
-        min_observations=3,
-        min_winning_votes=2,
-        min_mean_ocr_confidence=0.80,
+        min_observations=4,
+        min_winning_votes=3,
+        min_mean_ocr_confidence=0.85,
         iou_threshold=0.30,
         center_distance_threshold=DEFAULT_CENTER_DISTANCE_THRESHOLD,
         track_gap_s=2.0,
+        min_vote_ratio=0.60,
+        min_mean_detector_confidence=0.45,
         show_plate_text=False,
         gps_label=str(request.gps_path),
         gps_source_type=request.gps_source_type,

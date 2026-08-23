@@ -15,7 +15,7 @@ from folium.plugins import HeatMap
 from streamlit_folium import st_folium
 
 from urban_intelligence.classes import normalize_class_name
-from urban_intelligence.command_center import build_operational_scene
+from urban_intelligence.command_center import build_operational_scene, filter_scene_at
 from urban_intelligence.demo_jobs import (
     UploadValidationError,
     list_completed_runs,
@@ -26,6 +26,7 @@ from urban_intelligence.demo_jobs import (
     run_analysis,
 )
 from urban_intelligence.gps import load_gps_csv
+from urban_intelligence.review import load_reviews, review_summary, save_review
 
 st.set_page_config(
     page_title="DrishtiPath Command Centre",
@@ -65,6 +66,15 @@ st.markdown(
       }
       [data-testid="stMetricValue"] {color: #f5fbff; letter-spacing: -.025em;}
       [data-testid="stTabs"] button {font-weight: 650; letter-spacing: .01em;}
+      [data-testid="stSegmentedControl"] button {
+        border-color: rgba(111, 151, 181, .28); font-weight: 700;
+      }
+      [data-testid="stSegmentedControl"] button[aria-pressed="true"] {
+        color: #06141f; background: linear-gradient(90deg, #24e0cf, #62c6ff);
+      }
+      button:focus-visible, [tabindex="0"]:focus-visible {
+        outline: 2px solid #7ef0e5 !important; outline-offset: 2px;
+      }
       [data-testid="stFileUploaderDropzone"] {
         border: 1px dashed rgba(36, 224, 207, .55);
         background: rgba(14, 35, 52, .65);
@@ -78,6 +88,11 @@ st.markdown(
         padding: 1rem 1.1rem; border: 1px solid #26364a; border-radius: .9rem;
         background: linear-gradient(135deg, rgba(16, 28, 44, .96), rgba(8, 20, 35, .96));
         min-height: 98px;
+        transition: transform .18s ease, border-color .18s ease, box-shadow .18s ease;
+      }
+      .mission-card:hover {
+        transform: translateY(-3px); border-color: rgba(36, 224, 207, .55);
+        box-shadow: 0 16px 38px rgba(0, 0, 0, .24);
       }
       .eyebrow {color: #62e6da; font-size: .75rem; letter-spacing: .12em; font-weight: 700;}
       .muted {color: #91a4b7; font-size: .88rem;}
@@ -96,6 +111,7 @@ st.markdown(
           linear-gradient(90deg, rgba(93, 149, 183, .17) 1px, transparent 1px);
         background-size: 34px 34px;
         mask-image: linear-gradient(90deg, transparent 25%, black 100%);
+        animation: dp-grid-drift 12s linear infinite;
       }
       .hero-title {font-size: 2rem; line-height: 1.08; font-weight: 760; margin: .28rem 0 .45rem;}
       .hero-meta {color: #a7bac9; font-size: .9rem;}
@@ -109,6 +125,21 @@ st.markdown(
         70% {box-shadow: 0 0 0 9px rgba(36,224,207,0)}
         100% {box-shadow: 0 0 0 0 rgba(36,224,207,0)}
       }
+      @keyframes dp-grid-drift {
+        from {background-position: 0 0, 0 0}
+        to {background-position: 68px 34px, 34px 68px}
+      }
+      .quality-ribbon {
+        display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: .7rem;
+        margin: .75rem 0 1rem;
+      }
+      .quality-chip {
+        padding: .8rem .9rem; border-radius: .85rem;
+        border: 1px solid rgba(111, 151, 181, .22);
+        background: linear-gradient(145deg, rgba(16, 35, 54, .88), rgba(8, 22, 38, .88));
+      }
+      .quality-chip strong {display:block; color:#eafaff; margin-bottom:.18rem;}
+      @media (max-width: 800px) {.quality-ribbon {grid-template-columns: 1fr;}}
       .intel-panel {
         padding: 1rem 1.05rem; border-radius: 1rem; min-height: 118px;
         border: 1px solid var(--dp-border); background: var(--dp-panel);
@@ -453,6 +484,70 @@ def resolve_evidence(path_value: object, artifacts_dir: Path) -> Path | None:
     return evidence_relative if evidence_relative.is_file() else None
 
 
+def render_review_controls(*, module: str, event_id: str, run_root: Path) -> None:
+    """Collect a durable human decision without changing model-produced evidence."""
+    path = run_root / "review_feedback.json"
+    reviews = load_reviews(path)
+    review_key = f"{module}:{event_id}"
+    existing = reviews.get(review_key, {})
+    label_to_value = {
+        "Confirm finding": "confirmed",
+        "Reject false positive": "rejected_false_positive",
+        "Needs field inspection": "needs_field_inspection",
+    }
+    value_to_label = {value: label for label, value in label_to_value.items()}
+    current_label = value_to_label.get(
+        str(existing.get("decision", "needs_field_inspection")),
+        "Needs field inspection",
+    )
+    st.markdown("#### Human review")
+    decision_label = st.segmented_control(
+        "Decision",
+        list(label_to_value),
+        default=current_label,
+        key=f"review-decision-{module}-{event_id}",
+    )
+    note = st.text_input(
+        "Reviewer note",
+        value=str(existing.get("note", "")),
+        max_chars=500,
+        key=f"review-note-{module}-{event_id}",
+        placeholder="Example: zebra paint, real pothole, inspect on route…",
+    )
+    if st.button(
+        "Save review decision",
+        key=f"review-save-{module}-{event_id}",
+        width="stretch",
+    ):
+        record = save_review(
+            path,
+            module=module,
+            event_id=event_id,
+            decision=label_to_value[decision_label or current_label],
+            note=note,
+        )
+        st.success(
+            f"Saved · {str(record['decision']).replace('_', ' ').title()} · "
+            f"active-learning label: {record['active_learning_label']}"
+        )
+
+    if path.is_file():
+        summary = review_summary(load_reviews(path))
+        st.caption(
+            f"Mission review ledger · {summary['confirmed']} confirmed · "
+            f"{summary['rejected_false_positive']} false positives · "
+            f"{summary['needs_field_inspection']} field checks"
+        )
+        st.download_button(
+            "Download review feedback",
+            data=path.read_bytes(),
+            file_name="drishtipath-review-feedback.json",
+            mime="application/json",
+            key=f"review-download-{module}-{event_id}",
+            width="stretch",
+        )
+
+
 def render_road_hazard_section(
     *,
     artifacts_dir: Path,
@@ -462,10 +557,18 @@ def render_road_hazard_section(
     bandwidth: dict,
 ) -> None:
     if events.empty and detections.empty:
-        st.info(
-            "No road-hazard artifacts in this directory. Run `python orchestrator.py` "
-            "and point the sidebar at `artifacts/latest`."
-        )
+        if metrics:
+            st.warning(
+                "The scan completed but no road-hazard observation passed the quality gates. "
+                "This does not prove the road is defect-free. Re-run High recall and add "
+                "missed frames to the India-specific fine-tuning set."
+            )
+            st.json(metrics)
+        else:
+            st.info(
+                "No road-hazard artifacts in this directory. Run a new scan or point the "
+                "engineering artifact path at an existing mission."
+            )
         return
 
     if not events.empty:
@@ -490,12 +593,34 @@ def render_road_hazard_section(
         f"{reduction:.1f}%" if bandwidth.get("measurement_valid", False) else "Not measured"
     )
 
-    metric_columns = st.columns(5)
-    metric_columns[0].metric("Confirmed events", len(filtered_events))
-    metric_columns[1].metric("Raw detections", int(metrics.get("detections", len(detections))))
-    metric_columns[2].metric("Edge FPS", f"{float(metrics.get('end_to_end_fps', 0)):.1f}")
-    metric_columns[3].metric("P95 inference", f"{float(metrics.get('p95_inference_ms', 0)):.0f} ms")
-    metric_columns[4].metric("Bandwidth saved", bandwidth_label)
+    metric_columns = st.columns(6)
+    metric_columns[0].metric("Confirmed hazards", len(filtered_events))
+    metric_columns[1].metric(
+        "Model proposals",
+        int(metrics.get("model_proposals", metrics.get("detections", len(detections)))),
+    )
+    metric_columns[2].metric(
+        "Quality-eligible",
+        int(metrics.get("detections", len(detections))),
+    )
+    metric_columns[3].metric("Edge FPS", f"{float(metrics.get('end_to_end_fps', 0)):.1f}")
+    metric_columns[4].metric(
+        "P95 inference",
+        f"{float(metrics.get('p95_inference_ms', 0)):.0f} ms",
+    )
+    metric_columns[5].metric("Bandwidth saved", bandwidth_label)
+
+    profile = str(metrics.get("quality_profile", "custom")).replace("_", " ").title()
+    st.caption(
+        f"Quality policy: {profile} · Only temporally confirmed events enter the map. "
+        "Model proposals are diagnostics, not verified hazards."
+    )
+    if len(filtered_events) <= 1 and int(metrics.get("processed_frames", 0)) >= 300:
+        st.warning(
+            "Low hazard yield for a long clip. Treat this as a possible recall warning—not a "
+            "clean-road result. Review the annotated video and export missed examples for "
+            "fine-tuning."
+        )
 
     overview_tab, evidence_tab, health_tab = st.tabs(
         ["Operational map", "Evidence review", "System metrics"]
@@ -555,6 +680,11 @@ def render_road_hazard_section(
                 st.write(f"Location: `{float(event['lat']):.6f}, {float(event['lon']):.6f}`")
                 st.write(f"Temporal hits: **{int(event['temporal_hits'])}**")
                 st.warning("Status: Pending human verification")
+                render_review_controls(
+                    module="road",
+                    event_id=str(event["event_id"]),
+                    run_root=artifacts_dir.parent,
+                )
 
     with health_tab:
         left, right = st.columns(2)
@@ -1062,14 +1192,34 @@ def render_anpr_section(artifacts_dir: Path, stage: dict[str, Any] | None = None
     if gps_source_type == "synthetic_demo":
         st.warning("ANPR coordinates use synthetic demo GPS, not real bus telemetry.")
 
-    columns = st.columns(4)
+    columns = st.columns(5)
     columns[0].metric("Sampled frames", int(metrics.get("sampled_frames", 0)))
-    columns[1].metric("Plate detections", int(metrics.get("total_detections", 0)))
-    columns[2].metric("OCR results", int(metrics.get("ocr_results", 0)))
-    columns[3].metric("Review queue", len(events))
+    columns[1].metric(
+        "Plate-like proposals",
+        int(metrics.get("plate_like_proposals", metrics.get("total_detections", 0))),
+    )
+    columns[2].metric(
+        "Quality-eligible",
+        int(metrics.get("quality_eligible_observations", metrics.get("total_detections", 0))),
+    )
+    columns[3].metric(
+        "Gate rejected",
+        int(metrics.get("geometry_or_confidence_rejections", 0)),
+    )
+    columns[4].metric("Verified tracks", len(events))
 
     if not events:
-        st.info("No plate track passed the multi-frame quality gate.")
+        st.success(
+            "No verified plate evidence. Any raw plate-like regions were rejected or failed "
+            "the multi-frame detector/OCR consensus gate."
+        )
+        with st.expander("Why proposals are not number plates"):
+            st.write(
+                "FastALPR first proposes rectangular regions. DrishtiPath reports a plate only "
+                "after size/shape checks, repeated spatial tracking, Indian-format validation, "
+                "OCR agreement, detector confidence and vote-ratio thresholds all pass."
+            )
+            st.json(metrics.get("plate_geometry_gate", {}))
         return
 
     safe_rows = [
@@ -1078,7 +1228,9 @@ def render_anpr_section(artifacts_dir: Path, stage: dict[str, Any] | None = None
             "plate": item.get("masked_plate", ""),
             "observations": item.get("observation_count", 0),
             "winning_votes": item.get("winning_ocr_votes", 0),
+            "vote_ratio": item.get("winning_vote_ratio", 0),
             "ocr_confidence": item.get("mean_ocr_confidence", 0),
+            "detector_confidence": item.get("mean_detector_confidence", 0),
             "status": item.get("status", "pending_review"),
         }
         for item in events
@@ -1108,6 +1260,11 @@ def render_anpr_section(artifacts_dir: Path, stage: dict[str, Any] | None = None
             f"{float(selected.get('longitude', 0)):.6f}`"
         )
         st.warning("Pending authorized human review. Plate text remains masked in this UI.")
+        render_review_controls(
+            module="anpr",
+            event_id=str(selected.get("event_id", "")),
+            run_root=artifacts_dir.parent,
+        )
 
 
 def render_run_summary(run_dir: Path) -> dict[str, Any]:
@@ -1274,6 +1431,36 @@ def render_command_center(
         unsafe_allow_html=True,
     )
 
+    replay_times = [
+        float(item.get("time_s", 0))
+        for item in [*scene.get("route_timed", []), *scene.get("timeline", [])]
+    ]
+    max_replay_s = max(replay_times, default=0.0)
+    replay_left, replay_right = st.columns([3, 1])
+    with replay_right:
+        replay_enabled = st.toggle(
+            "Mission replay",
+            value=False,
+            help="Scrub through the route and reveal intelligence as it was observed.",
+        )
+    if replay_enabled and max_replay_s > 0:
+        with replay_left:
+            replay_cutoff = st.slider(
+                "Mission time",
+                min_value=0.0,
+                max_value=float(max_replay_s),
+                value=float(max_replay_s),
+                step=max(0.1, float(max_replay_s) / 200),
+                format="%.1f s",
+            )
+        scene = filter_scene_at(scene, replay_cutoff)
+        st.caption(
+            f"Replay position {replay_cutoff:.1f}s · showing only intelligence available "
+            "at that moment"
+        )
+    else:
+        replay_left.caption("Live aggregate view · enable Mission replay to scrub the route")
+
     unique_vehicles = int(traffic_summary.get("total_unique_tracked_vehicles", 0))
     mean_occupancy = float(traffic_summary.get("average_occupancy", 0)) * 100
     edge_fps = float(
@@ -1345,6 +1532,9 @@ def render_scan_launcher(runs_root: Path) -> Path | None:
             type=["mp4", "mov", "avi", "mkv"],
             help="Maximum 500 MB and 15 minutes for the judge demo workflow.",
         )
+        if video_upload is not None:
+            with st.expander("Preview uploaded dashcam clip", expanded=True):
+                st.video(video_upload.getvalue())
         gps_mode_label = st.radio(
             "GPS source",
             ["Synthetic demo route", "Upload real telemetry"],
@@ -1372,6 +1562,20 @@ def render_scan_launcher(runs_root: Path) -> Path | None:
             "Full city scan": "full",
             "Custom scan": "custom",
         }[profile_label]
+        quality_label = st.segmented_control(
+            "Analysis sensitivity",
+            ["High recall", "Balanced", "Strict review"],
+            default="High recall",
+            help=(
+                "High recall searches harder for road damage and may produce more review "
+                "candidates. Strict review favours precision. ANPR always uses strict gates."
+            ),
+        )
+        quality_profile = {
+            "High recall": "high_recall",
+            "Balanced": "balanced",
+            "Strict review": "strict",
+        }[quality_label or "High recall"]
         module_labels = {
             "Road hazards": "road",
             "Traffic analytics": "traffic",
@@ -1391,6 +1595,38 @@ def render_scan_launcher(runs_root: Path) -> Path | None:
         except ValueError as exc:
             st.error(str(exc))
             modules = ()
+
+        quality_copy = {
+            "high_recall": (
+                "768 px + augmentation",
+                "2 hits in 7 observations",
+                "Best for missed potholes",
+            ),
+            "balanced": (
+                "704 px inference",
+                "3 hits in 5 observations",
+                "Balanced venue demo",
+            ),
+            "strict": (
+                "640 px inference",
+                "Higher confidence gate",
+                "Best for low false alerts",
+            ),
+        }[quality_profile]
+        st.markdown(
+            "<div class='quality-ribbon'>"
+            + "".join(
+                f"<div class='quality-chip'><strong>{escape(title)}</strong>"
+                f"<span class='muted'>{escape(value)}</span></div>"
+                for title, value in zip(
+                    ("VISION", "TEMPORAL GATE", "MISSION FIT"),
+                    quality_copy,
+                    strict=True,
+                )
+            )
+            + "</div>",
+            unsafe_allow_html=True,
+        )
 
         with st.expander("Model settings", expanded=False):
             road_model = st.text_input("Road-hazard model", "models/road_hazards.pt")
@@ -1430,6 +1666,12 @@ def render_scan_launcher(runs_root: Path) -> Path | None:
         column.caption(detail)
 
     all_checks_pass = bool(checks) and all(passed for passed, _ in checks.values())
+    runnable_module_exists = any(passed for passed, _ in checks.values())
+    if checks and not all_checks_pass and runnable_module_exists:
+        st.warning(
+            "Some optional modules are unavailable. The mission can still run: each stage "
+            "is isolated, and successful evidence will be preserved."
+        )
     inputs_ready = video_upload is not None and (
         gps_source_type == "synthetic_demo" or gps_upload is not None
     )
@@ -1437,7 +1679,7 @@ def render_scan_launcher(runs_root: Path) -> Path | None:
         "▶ Run DrishtiPath Scan",
         type="primary",
         width="stretch",
-        disabled=not (inputs_ready and all_checks_pass and modules),
+        disabled=not (inputs_ready and runnable_module_exists and modules),
     )
 
     if not start_scan:
@@ -1448,8 +1690,9 @@ def render_scan_launcher(runs_root: Path) -> Path | None:
             )
         return None
 
-    progress_bar = st.progress(0)
+    progress_bar = st.progress(0, text="Preparing isolated mission workspace")
     stage_text = st.empty()
+    mission_status = st.status("DrishtiPath mission starting", expanded=True)
 
     def update_progress(
         module: str,
@@ -1458,9 +1701,13 @@ def render_scan_launcher(runs_root: Path) -> Path | None:
         completed: int,
         total: int,
     ) -> None:
-        del module, status
-        progress_bar.progress(int((completed / max(1, total)) * 100))
+        del module
+        progress_bar.progress(
+            int((completed / max(1, total)) * 100),
+            text=message,
+        )
         stage_text.caption(message)
+        mission_status.write(f"{status.upper()} · {message}")
 
     try:
         stage_text.caption("Validating upload and GPS data")
@@ -1471,6 +1718,7 @@ def render_scan_launcher(runs_root: Path) -> Path | None:
             gps_source_type=gps_source_type,
             modules=modules,
             scan_profile=profile,
+            quality_profile=quality_profile,
             gps_payload=gps_upload.getbuffer() if gps_upload is not None else None,
             original_gps_name=gps_upload.name if gps_upload is not None else "gps.csv",
             road_model=road_model,
@@ -1493,23 +1741,41 @@ def render_scan_launcher(runs_root: Path) -> Path | None:
     except (UploadValidationError, ValueError, FileNotFoundError, OSError) as exc:
         progress_bar.empty()
         stage_text.empty()
+        mission_status.update(label="Mission validation failed", state="error")
         st.error(str(exc))
         return None
 
     st.session_state["active_run_dir"] = str(request.run_dir)
-    progress_bar.progress(100)
+    progress_bar.progress(100, text="Mission analysis complete")
     if manifest.get("status") == "completed":
-        st.success("Scan complete. Open the result tabs to review intelligence.")
+        mission_status.update(label="Mission complete", state="complete", expanded=False)
+        st.success("Scan complete. Open Mission control or Evidence review to inspect the results.")
     else:
+        mission_status.update(
+            label="Mission completed with module warnings",
+            state="error",
+            expanded=True,
+        )
         st.warning("Scan finished with one or more failed modules. Successful results were kept.")
     return request.run_dir
 
 
 def main() -> None:
-    st.title("DrishtiPath Urban Intelligence Command Centre")
-    st.caption("One upload · Edge intelligence · GIS evidence · Human-reviewed enforcement")
+    st.markdown(
+        "<div class='command-hero'>"
+        "<div class='eyebrow'><span class='live-dot'></span>DRISHTIPATH · URBAN INTELLIGENCE</div>"
+        "<div class='hero-title'>Turn every bus into a moving city sensor.</div>"
+        "<div class='hero-meta'>One upload · Edge AI · 3D GIS · Review-safe evidence · "
+        "Bandwidth-aware operations</div></div>",
+        unsafe_allow_html=True,
+    )
 
     runs_root = Path("artifacts/ui_runs")
+    presentation_mode = st.sidebar.toggle(
+        "Presentation mode",
+        value=True,
+        help="Keeps judge-facing workflows focused and hides engineering diagnostics.",
+    )
     recent_runs = list_completed_runs(runs_root)
     if recent_runs:
         selected_run = st.sidebar.selectbox(
@@ -1524,7 +1790,7 @@ def main() -> None:
     if st.sidebar.button("Clear active run", width="stretch"):
         st.session_state.pop("active_run_dir", None)
 
-    with st.sidebar.expander("Legacy artifact paths"):
+    with st.sidebar.expander("Engineering artifact paths", expanded=False):
         artifacts_value = st.text_input("Artifacts directory", "artifacts/latest")
         edge_report_value = st.text_input(
             "Edge benchmark report",
@@ -1543,33 +1809,18 @@ def main() -> None:
         st.rerun()
 
     edge_report_path = Path(edge_report_value)
-
-    (
-        scan_tab,
-        command_tab,
-        road_tab,
-        traffic_tab,
-        assets_tab,
-        incident_tab,
-        fleet_tab,
-        anpr_tab,
-        edge_tab,
-        live_edge_tab,
-    ) = st.tabs(
-        [
-            "New scan",
-            "3D command centre",
-            "Road hazards",
-            "Traffic analytics",
-            "Urban assets",
-            "Safety & incidents",
-            "Fleet intelligence",
-            "ANPR review",
-            "Edge benchmark",
-            "Live edge",
-        ]
+    workspaces = ["New scan", "Mission control", "Evidence review", "Operations"]
+    if not presentation_mode:
+        workspaces.append("Engineering")
+    workspace = st.segmented_control(
+        "Command workspace",
+        workspaces,
+        default="New scan",
+        selection_mode="single",
+        label_visibility="collapsed",
     )
-    with scan_tab:
+
+    if workspace == "New scan":
         new_run = render_scan_launcher(runs_root)
         if new_run is not None:
             st.session_state["active_run_dir"] = str(new_run)
@@ -1582,7 +1833,12 @@ def main() -> None:
     assets_dir = active_run / "assets" if active_run else Path(artifacts_value)
     manifest = load_manifest(active_run) if active_run else {}
 
-    with command_tab:
+    events = load_csv(str(road_dir / "events.csv"))
+    detections = load_csv(str(road_dir / "detections.csv"))
+    metrics = load_json(str(road_dir / "metrics.json"))
+    bandwidth = load_json(str(road_dir / "bandwidth_report.json"))
+
+    if workspace == "Mission control":
         if active_run:
             render_command_center(
                 active_run=active_run,
@@ -1593,42 +1849,54 @@ def main() -> None:
                 manifest=manifest,
             )
         else:
-            st.markdown(
-                "<div class='command-hero'>"
-                "<div class='eyebrow'>DRISHTIPATH · MISSION CONTROL</div>"
-                "<div class='hero-title'>Your city intelligence view begins with one upload.</div>"
-                "<div class='hero-meta'>Run a new scan or select a previous dashboard run "
-                "from the sidebar.</div></div>",
-                unsafe_allow_html=True,
-            )
+            st.info("Upload a mission or select a recent run to activate the 3D command centre.")
 
-    events = load_csv(str(road_dir / "events.csv"))
-    detections = load_csv(str(road_dir / "detections.csv"))
-    metrics = load_json(str(road_dir / "metrics.json"))
-    bandwidth = load_json(str(road_dir / "bandwidth_report.json"))
-    with road_tab:
-        render_road_hazard_section(
-            artifacts_dir=road_dir,
-            events=events,
-            detections=detections,
-            metrics=metrics,
-            bandwidth=bandwidth,
+    elif workspace == "Evidence review":
+        evidence_view = st.segmented_control(
+            "Evidence layer",
+            ["Road hazards", "Urban assets", "ANPR", "Safety & incidents"],
+            default="Road hazards",
+            selection_mode="single",
         )
-    with traffic_tab:
-        render_traffic_section(traffic_dir)
-    with assets_tab:
-        render_asset_section(assets_dir)
-    with incident_tab:
-        render_incident_section(active_run)
-    with fleet_tab:
-        render_fleet_section(Path(fleet_export_value))
-    with anpr_tab:
-        stage = manifest.get("stages", {}).get("anpr") if manifest else None
-        render_anpr_section(anpr_dir, stage)
-    with edge_tab:
-        render_edge_benchmark_section(edge_report_path)
-    with live_edge_tab:
-        render_live_edge_section(Path(live_edge_value))
+        if evidence_view == "Road hazards":
+            render_road_hazard_section(
+                artifacts_dir=road_dir,
+                events=events,
+                detections=detections,
+                metrics=metrics,
+                bandwidth=bandwidth,
+            )
+        elif evidence_view == "Urban assets":
+            render_asset_section(assets_dir)
+        elif evidence_view == "ANPR":
+            stage = manifest.get("stages", {}).get("anpr") if manifest else None
+            render_anpr_section(anpr_dir, stage)
+        else:
+            render_incident_section(active_run)
+
+    elif workspace == "Operations":
+        operation_view = st.segmented_control(
+            "Operational layer",
+            ["Traffic analytics", "Fleet intelligence"],
+            default="Traffic analytics",
+            selection_mode="single",
+        )
+        if operation_view == "Traffic analytics":
+            render_traffic_section(traffic_dir)
+        else:
+            render_fleet_section(Path(fleet_export_value))
+
+    elif workspace == "Engineering":
+        engineering_view = st.segmented_control(
+            "Engineering view",
+            ["Edge benchmark", "Live edge"],
+            default="Edge benchmark",
+            selection_mode="single",
+        )
+        if engineering_view == "Edge benchmark":
+            render_edge_benchmark_section(edge_report_path)
+        else:
+            render_live_edge_section(Path(live_edge_value))
 
 
 if __name__ == "__main__":

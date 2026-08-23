@@ -21,6 +21,7 @@ from anpr_pipeline import (
     mask_plate,
     normalize_plate,
     object_relative_center_distance,
+    plate_geometry_is_plausible,
     run_pipeline,
     validate_pipeline_settings,
 )
@@ -249,6 +250,73 @@ def test_low_confidence_track_is_not_confirmed() -> None:
             min_mean_ocr_confidence=0.80,
         )
         is None
+    )
+
+
+def test_strict_gate_rejects_low_vote_ratio_and_weak_detector_track() -> None:
+    track = anpr_pipeline.PlateTrack(track_id="noise")
+    track.observations = [
+        observation(index, (100 + index, 100, 180 + index, 140), plate=plate)
+        for index, plate in enumerate(
+            [
+                "DL01AB1234",
+                "DL01AB1234",
+                "DL01AB1234",
+                "HR26CD5678",
+                "KA01EF9012",
+                "UP32GH3456",
+            ]
+        )
+    ]
+    assert (
+        build_confirmed_event(
+            track,
+            min_observations=4,
+            min_winning_votes=3,
+            min_mean_ocr_confidence=0.80,
+            min_vote_ratio=0.60,
+            min_mean_detector_confidence=0.45,
+        )
+        is None
+    )
+
+    weak_detector_track = anpr_pipeline.PlateTrack(track_id="weak-detector")
+    weak_detector_track.observations = [
+        observation(
+            index,
+            (100 + index, 100, 180 + index, 140),
+            detector_confidence=0.30,
+        )
+        for index in range(4)
+    ]
+    assert (
+        build_confirmed_event(
+            weak_detector_track,
+            min_observations=4,
+            min_winning_votes=3,
+            min_mean_ocr_confidence=0.80,
+            min_vote_ratio=0.60,
+            min_mean_detector_confidence=0.45,
+        )
+        is None
+    )
+
+
+def test_plate_geometry_gate_rejects_tiny_square_and_extreme_boxes() -> None:
+    assert plate_geometry_is_plausible(
+        (100, 100, 260, 150),
+        frame_width=1280,
+        frame_height=720,
+    )
+    assert not plate_geometry_is_plausible(
+        (100, 100, 105, 105),
+        frame_width=1280,
+        frame_height=720,
+    )
+    assert not plate_geometry_is_plausible(
+        (100, 100, 150, 150),
+        frame_width=1280,
+        frame_height=720,
     )
 
 
@@ -491,6 +559,51 @@ def test_run_pipeline_writes_null_result_when_unconfirmed(
     assert result["confirmed_events"] == []
     assert result["strongest_event"] is None
     assert json.loads((tmp_path / "out" / "anpr_result.json").read_text()) is None
+
+
+def test_no_plate_clip_reports_proposals_without_claiming_plate_evidence(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import sys
+
+    monkeypatch.setitem(sys.modules, "cv2", _FakeCv2())
+
+    def fake_predict(frame) -> list[FakeALPRResult]:
+        index = getattr(frame, "marker", 0)
+        return [
+            FakeALPRResult(
+                detection=FakeDetection(0.91, FakeBBox(20, 20, 24, 24)),
+                ocr=FakeOcr("DL01AB1234", 0.99),
+            ),
+            FakeALPRResult(
+                detection=FakeDetection(0.80, FakeBBox(40, 40, 100, 70)),
+                ocr=FakeOcr(f"DL01AB12{index:02d}", 0.97),
+            ),
+            FakeALPRResult(
+                detection=FakeDetection(0.25, FakeBBox(80, 50, 140, 80)),
+                ocr=FakeOcr("HR26CD5678", 0.95),
+            ),
+        ]
+
+    result = run_pipeline(
+        **_pipeline_kwargs(
+            tmp_path,
+            fake_predict,
+            detector_confidence=0.35,
+            min_observations=4,
+            min_winning_votes=3,
+            min_vote_ratio=0.60,
+            min_mean_detector_confidence=0.45,
+        )
+    )
+    metrics = result["metrics"]
+    assert metrics["plate_like_proposals"] == 15
+    assert metrics["geometry_or_confidence_rejections"] == 10
+    assert metrics["quality_eligible_observations"] == 5
+    assert metrics["confirmed_tracks"] == 0
+    assert metrics["quality_status"] == "no_verified_plate_evidence"
+    assert result["confirmed_events"] == []
 
 
 def test_evidence_uses_best_observation_frame_not_last(

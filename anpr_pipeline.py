@@ -21,8 +21,11 @@ BHARAT_SERIES_PLATE_PATTERN = re.compile(r"^[0-9]{2}BH[0-9]{4}[A-Z]{1,2}$")
 DEFAULT_DETECTOR_MODEL = "yolo-v9-t-384-license-plate-end2end"
 DEFAULT_OCR_MODEL = "cct-xs-v2-global-model"
 DEFAULT_EXECUTION_PROVIDER = "CPUExecutionProvider"
-DEFAULT_CENTER_DISTANCE_THRESHOLD = 1.5
-DEFAULT_AREA_RATIO_MAX = 2.5
+DEFAULT_CENTER_DISTANCE_THRESHOLD = 0.85
+DEFAULT_AREA_RATIO_MAX = 2.0
+DEFAULT_MIN_PLATE_AREA_RATIO = 0.00008
+DEFAULT_MIN_PLATE_ASPECT_RATIO = 1.1
+DEFAULT_MAX_PLATE_ASPECT_RATIO = 7.0
 GPS_SOURCE_TYPES = ("synthetic_demo", "real_telemetry", "unknown")
 
 
@@ -180,6 +183,29 @@ def bbox_area_ratio(
     return larger / smaller
 
 
+def plate_geometry_is_plausible(
+    bbox: tuple[int, int, int, int],
+    *,
+    frame_width: int,
+    frame_height: int,
+    min_area_ratio: float = DEFAULT_MIN_PLATE_AREA_RATIO,
+    min_aspect_ratio: float = DEFAULT_MIN_PLATE_ASPECT_RATIO,
+    max_aspect_ratio: float = DEFAULT_MAX_PLATE_ASPECT_RATIO,
+) -> bool:
+    """Reject tiny or implausibly shaped plate-like proposals before OCR voting."""
+    width = bbox[2] - bbox[0]
+    height = bbox[3] - bbox[1]
+    frame_area = frame_width * frame_height
+    if width <= 0 or height <= 0 or frame_area <= 0:
+        return False
+    area_ratio = (width * height) / frame_area
+    aspect_ratio = width / height
+    return (
+        area_ratio >= min_area_ratio
+        and min_aspect_ratio <= aspect_ratio <= max_aspect_ratio
+    )
+
+
 # Backward-compatible alias used by older tests/docs naming.
 normalized_center_distance = object_relative_center_distance
 
@@ -320,6 +346,11 @@ def validate_pipeline_settings(
     center_distance_threshold: float,
     track_gap_s: float,
     area_ratio_max: float = DEFAULT_AREA_RATIO_MAX,
+    min_vote_ratio: float = 0.0,
+    min_mean_detector_confidence: float = 0.0,
+    min_plate_area_ratio: float = DEFAULT_MIN_PLATE_AREA_RATIO,
+    min_plate_aspect_ratio: float = DEFAULT_MIN_PLATE_ASPECT_RATIO,
+    max_plate_aspect_ratio: float = DEFAULT_MAX_PLATE_ASPECT_RATIO,
     gps_source_type: str = "synthetic_demo",
 ) -> None:
     if not 0.0 <= detector_confidence <= 1.0:
@@ -342,6 +373,14 @@ def validate_pipeline_settings(
         raise ValueError("track_gap_s must be greater than 0")
     if area_ratio_max <= 0:
         raise ValueError("area_ratio_max must be greater than 0")
+    if not 0.0 <= min_vote_ratio <= 1.0:
+        raise ValueError("min_vote_ratio must be between 0 and 1")
+    if not 0.0 <= min_mean_detector_confidence <= 1.0:
+        raise ValueError("min_mean_detector_confidence must be between 0 and 1")
+    if not 0.0 <= min_plate_area_ratio <= 1.0:
+        raise ValueError("min_plate_area_ratio must be between 0 and 1")
+    if min_plate_aspect_ratio <= 0 or max_plate_aspect_ratio < min_plate_aspect_ratio:
+        raise ValueError("plate aspect-ratio limits are invalid")
     if gps_source_type not in GPS_SOURCE_TYPES:
         raise ValueError(
             f"gps_source_type must be one of: {', '.join(GPS_SOURCE_TYPES)}"
@@ -354,6 +393,8 @@ def build_confirmed_event(
     min_observations: int,
     min_winning_votes: int,
     min_mean_ocr_confidence: float,
+    min_vote_ratio: float = 0.0,
+    min_mean_detector_confidence: float = 0.0,
 ) -> dict[str, object] | None:
     if len(track.observations) < min_observations:
         return None
@@ -373,10 +414,18 @@ def build_confirmed_event(
 
     best_observation = max(track.observations, key=observation_rank)
     detector_confidences = [item.detector_confidence for item in track.observations]
+    mean_detector_confidence = sum(detector_confidences) / len(detector_confidences)
+    vote_ratio = winning_votes / len(track.observations)
+    if vote_ratio < min_vote_ratio:
+        return None
+    if mean_detector_confidence < min_mean_detector_confidence:
+        return None
     passes_gate = (
         len(track.observations) >= min_observations
         and winning_votes >= min_winning_votes
         and mean_ocr_confidence >= min_mean_ocr_confidence
+        and vote_ratio >= min_vote_ratio
+        and mean_detector_confidence >= min_mean_detector_confidence
         and is_plausible_indian_plate(plate)
     )
 
@@ -392,8 +441,9 @@ def build_confirmed_event(
         "last_video_time_s": round(track.last_observation.video_time_s, 3),
         "observation_count": len(track.observations),
         "winning_ocr_votes": winning_votes,
+        "winning_vote_ratio": round(vote_ratio, 4),
         "mean_ocr_confidence": round(mean_ocr_confidence, 4),
-        "mean_detector_confidence": round(sum(detector_confidences) / len(detector_confidences), 4),
+        "mean_detector_confidence": round(mean_detector_confidence, 4),
         "max_detector_confidence": round(max(detector_confidences), 4),
         "bbox": list(best_observation.bbox),
         "latitude": round(best_observation.latitude, 7),
@@ -420,6 +470,12 @@ def convert_alpr_results(
     frame_index: int,
     video_time_s: float,
     gps_track: GPSTrack,
+    frame_width: int = 0,
+    frame_height: int = 0,
+    min_detector_confidence: float = 0.0,
+    min_plate_area_ratio: float = 0.0,
+    min_plate_aspect_ratio: float = 0.0,
+    max_plate_aspect_ratio: float = float("inf"),
 ) -> list[PlateObservation]:
     location = gps_track.at(video_time_s)
     observations: list[PlateObservation] = []
@@ -432,6 +488,18 @@ def convert_alpr_results(
             int(bbox_obj.x2),
             int(bbox_obj.y2),
         )
+        detector_confidence = float(detection.confidence)
+        if detector_confidence < min_detector_confidence:
+            continue
+        if frame_width > 0 and frame_height > 0 and not plate_geometry_is_plausible(
+            bbox,
+            frame_width=frame_width,
+            frame_height=frame_height,
+            min_area_ratio=min_plate_area_ratio,
+            min_aspect_ratio=min_plate_aspect_ratio,
+            max_aspect_ratio=max_plate_aspect_ratio,
+        ):
+            continue
         ocr_text = ""
         ocr_confidence = 0.0
         if result.ocr is not None and result.ocr.text:
@@ -444,7 +512,7 @@ def convert_alpr_results(
                 bbox=bbox,
                 normalized_plate=ocr_text,
                 ocr_confidence=ocr_confidence,
-                detector_confidence=float(detection.confidence),
+                detector_confidence=detector_confidence,
                 latitude=location.latitude,
                 longitude=location.longitude,
             )
@@ -620,6 +688,11 @@ def run_pipeline(
     ocr_model: str = DEFAULT_OCR_MODEL,
     execution_provider: str = DEFAULT_EXECUTION_PROVIDER,
     area_ratio_max: float = DEFAULT_AREA_RATIO_MAX,
+    min_vote_ratio: float = 0.60,
+    min_mean_detector_confidence: float = 0.45,
+    min_plate_area_ratio: float = DEFAULT_MIN_PLATE_AREA_RATIO,
+    min_plate_aspect_ratio: float = DEFAULT_MIN_PLATE_ASPECT_RATIO,
+    max_plate_aspect_ratio: float = DEFAULT_MAX_PLATE_ASPECT_RATIO,
 ) -> dict[str, object]:
     import cv2
 
@@ -633,6 +706,11 @@ def run_pipeline(
         center_distance_threshold=center_distance_threshold,
         track_gap_s=track_gap_s,
         area_ratio_max=area_ratio_max,
+        min_vote_ratio=min_vote_ratio,
+        min_mean_detector_confidence=min_mean_detector_confidence,
+        min_plate_area_ratio=min_plate_area_ratio,
+        min_plate_aspect_ratio=min_plate_aspect_ratio,
+        max_plate_aspect_ratio=max_plate_aspect_ratio,
         gps_source_type=gps_source_type,
     )
 
@@ -663,6 +741,8 @@ def run_pipeline(
     evidence_candidates: dict[str, TrackEvidenceCandidate] = {}
     sampled_frames = 0
     total_detections = 0
+    plate_like_proposals = 0
+    geometry_or_confidence_rejections = 0
     ocr_results = 0
     frame_index = 0
     start = time.perf_counter()
@@ -676,12 +756,20 @@ def run_pipeline(
                 sampled_frames += 1
                 video_time_s = frame_index / source_fps
                 results = predict_fn(frame)
+                plate_like_proposals += len(results)
                 observations = convert_alpr_results(
                     results,
                     frame_index=frame_index,
                     video_time_s=video_time_s,
                     gps_track=gps_track,
+                    frame_width=frame_width,
+                    frame_height=frame_height,
+                    min_detector_confidence=detector_confidence,
+                    min_plate_area_ratio=min_plate_area_ratio,
+                    min_plate_aspect_ratio=min_plate_aspect_ratio,
+                    max_plate_aspect_ratio=max_plate_aspect_ratio,
                 )
+                geometry_or_confidence_rejections += len(results) - len(observations)
                 total_detections += len(observations)
                 ocr_results += sum(1 for item in observations if item.normalized_plate)
                 assignments = tracker.update(observations, frame_width, frame_height)
@@ -707,6 +795,8 @@ def run_pipeline(
             min_observations=min_observations,
             min_winning_votes=min_winning_votes,
             min_mean_ocr_confidence=min_mean_ocr_confidence,
+            min_vote_ratio=min_vote_ratio,
+            min_mean_detector_confidence=min_mean_detector_confidence,
         )
         if event is None:
             continue
@@ -734,6 +824,9 @@ def run_pipeline(
         "actual_sampled_fps": round(actual_sampled_fps, 3),
         "sample_interval_frames": sample_interval,
         "sampled_frames": sampled_frames,
+        "plate_like_proposals": plate_like_proposals,
+        "geometry_or_confidence_rejections": geometry_or_confidence_rejections,
+        "quality_eligible_observations": total_detections,
         "total_detections": total_detections,
         "ocr_results": ocr_results,
         "confirmed_tracks": len(confirmed_events),
@@ -743,6 +836,18 @@ def run_pipeline(
         "gps_source_type": gps_source_type,
         "evidence_bytes": evidence_bytes,
         "detector_confidence_threshold": detector_confidence,
+        "minimum_vote_ratio": min_vote_ratio,
+        "minimum_mean_detector_confidence": min_mean_detector_confidence,
+        "plate_geometry_gate": {
+            "minimum_area_ratio": min_plate_area_ratio,
+            "minimum_aspect_ratio": min_plate_aspect_ratio,
+            "maximum_aspect_ratio": max_plate_aspect_ratio,
+        },
+        "quality_status": (
+            "verified_plate_evidence_pending_review"
+            if confirmed_events
+            else "no_verified_plate_evidence"
+        ),
     }
 
     write_observations_csv(output_dir / "anpr_observations.csv", all_observations)
@@ -799,11 +904,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--detector-model", default=DEFAULT_DETECTOR_MODEL)
     parser.add_argument("--ocr-model", default=DEFAULT_OCR_MODEL)
     parser.add_argument("--execution-provider", default=DEFAULT_EXECUTION_PROVIDER)
-    parser.add_argument("--confidence", type=float, default=0.20)
+    parser.add_argument("--confidence", type=float, default=0.35)
     parser.add_argument("--sample-fps", type=float, default=5.0)
-    parser.add_argument("--min-observations", type=int, default=3)
-    parser.add_argument("--min-winning-votes", type=int, default=2)
-    parser.add_argument("--min-mean-ocr-confidence", type=float, default=0.80)
+    parser.add_argument("--min-observations", type=int, default=4)
+    parser.add_argument("--min-winning-votes", type=int, default=3)
+    parser.add_argument("--min-mean-ocr-confidence", type=float, default=0.85)
+    parser.add_argument("--min-vote-ratio", type=float, default=0.60)
+    parser.add_argument("--min-mean-detector-confidence", type=float, default=0.45)
+    parser.add_argument("--min-plate-area-ratio", type=float, default=DEFAULT_MIN_PLATE_AREA_RATIO)
     parser.add_argument("--iou-threshold", type=float, default=0.30)
     parser.add_argument(
         "--center-distance-threshold",
@@ -811,7 +919,7 @@ def parse_args() -> argparse.Namespace:
         default=DEFAULT_CENTER_DISTANCE_THRESHOLD,
         help=(
             "Object-relative centre-distance limit "
-            "(distance / max box diagonal); default 1.5"
+            f"(distance / max box diagonal); default {DEFAULT_CENTER_DISTANCE_THRESHOLD}"
         ),
     )
     parser.add_argument(
@@ -849,6 +957,9 @@ def main() -> None:
             center_distance_threshold=args.center_distance_threshold,
             track_gap_s=args.track_gap_s,
             area_ratio_max=args.area_ratio_max,
+            min_vote_ratio=args.min_vote_ratio,
+            min_mean_detector_confidence=args.min_mean_detector_confidence,
+            min_plate_area_ratio=args.min_plate_area_ratio,
             gps_source_type=args.gps_source_type,
         )
     except ValueError as exc:
@@ -880,6 +991,9 @@ def main() -> None:
         ocr_model=args.ocr_model,
         execution_provider=args.execution_provider,
         area_ratio_max=args.area_ratio_max,
+        min_vote_ratio=args.min_vote_ratio,
+        min_mean_detector_confidence=args.min_mean_detector_confidence,
+        min_plate_area_ratio=args.min_plate_area_ratio,
     )
     print(json.dumps(result, indent=2))
 
