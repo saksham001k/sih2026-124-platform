@@ -1,0 +1,16 @@
+[project]
+name = "drishtipath-urban-intelligence"
+version = "0.2.0"
+description = "Edge-first mobile urban intelligence prototype for SIH 26124"
+requires-python = ">=3.10"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+
+[tool.ruff]
+target-version = "py310"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP"]

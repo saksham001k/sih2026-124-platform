@@ -12,12 +12,24 @@ __pycache__/
 .vscode/
 .idea/
 
-# Datasets (Large files - optional, but good to ignore if they are huge)
+# Models and datasets
 *.h5
 *.pt
 *.pth
 *.zip
 *.tar.gz
+*.onnx
+*_ncnn_model/
+
+# Generated runtime artifacts
+artifacts/
+output*.mp4
+heatmap.html
+
+# Test and tool caches
+.pytest_cache/
+.ruff_cache/
+.coverage
 
 # Local configs
 *.local
