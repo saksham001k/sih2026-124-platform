@@ -16,8 +16,6 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-import numpy as np
-
 from edge_agent import RawDetection, RunnerSpec, run_agent
 from urban_intelligence.delivery import DeliveryConfig, DeliveryResponse, EvidenceDeliveryClient
 from urban_intelligence.edge_runtime import EvidenceOutbox, write_json_atomic
@@ -64,12 +62,11 @@ class VirtualCapture:
     def get(self, _: int) -> float:
         return 30.0
 
-    def read(self) -> tuple[bool, np.ndarray | None]:
+    def read(self) -> tuple[bool, VirtualFrame | None]:
         if self.index >= self.frame_count:
             return False, None
         time.sleep(self.frame_delay_s)
-        frame = np.zeros((720, 1280, 3), dtype=np.uint8)
-        frame[:, :, 1] = self.index % 255
+        frame = VirtualFrame()
         self.index += 1
         return True, frame
 
@@ -87,18 +84,28 @@ class VirtualCV2:
         return self.capture
 
     @staticmethod
-    def imwrite(path: str, image: np.ndarray) -> bool:
+    def imwrite(path: str, image: VirtualFrame) -> bool:
         if image.size == 0:
             return False
         Path(path).write_bytes(b"virtual-pi-jpeg-evidence\n")
         return True
 
 
+class VirtualFrame:
+    """Dependency-free ndarray surface used by crop/evidence code."""
+
+    shape = (720, 1280, 3)
+    size = 720 * 1280 * 3
+
+    def __getitem__(self, _: object) -> VirtualFrame:
+        return self
+
+
 @dataclass(slots=True)
 class VirtualRunner:
     spec: RunnerSpec
 
-    def infer(self, _: np.ndarray) -> list[RawDetection]:
+    def infer(self, _: VirtualFrame) -> list[RawDetection]:
         latency_s = {
             "traffic": 0.006,
             "road_damage": 0.009,
