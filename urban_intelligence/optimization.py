@@ -7,6 +7,7 @@ import json
 import math
 import os
 import platform
+import statistics
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -18,8 +19,10 @@ SUPPORTED_PRECISIONS = {
     "onnx": ("fp32", "fp16", "int8"),
     "ncnn": ("fp32", "fp16"),
 }
-SCHEMA_VERSION = "1.0"
+SAMPLING_MODES = ("uniform", "sequential")
+SCHEMA_VERSION = "1.1"
 PARITY_IOU_THRESHOLD = 0.50
+DEVICE_TREE_MODEL_PATH = Path("/proc/device-tree/model")
 
 
 @dataclass(frozen=True, slots=True)
@@ -63,8 +66,11 @@ def validate_benchmark_settings(
     calibration_data: str | None = None,
     precision: str = "fp32",
     export_format: str = "onnx",
+    sampling: str = "uniform",
 ) -> None:
     validate_precision_format(export_format, precision)
+    if sampling not in SAMPLING_MODES:
+        raise ValueError(f"sampling must be one of: {', '.join(SAMPLING_MODES)}")
     if warmup_runs < 0:
         raise ValueError("warmup_runs must be >= 0")
     if benchmark_frames < 1:
@@ -140,12 +146,20 @@ def artifact_record(path: Path) -> dict[str, Any]:
     return record
 
 
-def size_reduction(source_bytes: int, exported_bytes: int) -> dict[str, float | int]:
+def size_reduction(source_bytes: int, exported_bytes: int) -> dict[str, float | int | str]:
     difference = source_bytes - exported_bytes
     percent = (difference / source_bytes * 100.0) if source_bytes > 0 else 0.0
+    if difference >= 0:
+        label = "size_reduction"
+        display_percent = round(percent, 4)
+    else:
+        label = "size_increase"
+        display_percent = round(abs(percent), 4)
     return {
         "difference_bytes": difference,
         "reduction_percent": round(percent, 4),
+        "change_label": label,
+        "change_percent": display_percent,
     }
 
 
@@ -164,22 +178,61 @@ def summarize_timings(
     if not wall_ms:
         raise ValueError("zero valid benchmark samples collected")
     inference = [value for value in inference_ms if value > 0]
-    wall_median = float(sorted(wall_ms)[len(wall_ms) // 2]) if wall_ms else 0.0
-    if len(wall_ms) % 2 == 0 and wall_ms:
-        mid = len(wall_ms) // 2
-        wall_median = (wall_ms[mid - 1] + wall_ms[mid]) / 2.0
-    inference_median = float(sorted(inference)[len(inference) // 2]) if inference else 0.0
-    if len(inference) % 2 == 0 and inference:
-        mid = len(inference) // 2
-        inference_median = (inference[mid - 1] + inference[mid]) / 2.0
+    wall_median = float(statistics.median(wall_ms))
+    wall_mean = float(statistics.mean(wall_ms))
+    total_wall_time_ms = float(sum(wall_ms))
+    inference_median = float(statistics.median(inference)) if inference else 0.0
+    measured_fps = (
+        len(wall_ms) / (total_wall_time_ms / 1000.0) if total_wall_time_ms > 0 else 0.0
+    )
+    fps_from_median = (1000.0 / wall_median) if wall_median > 0 else 0.0
     return {
         "sample_count": len(wall_ms),
         "inference_median_ms": round(inference_median, 3),
         "inference_p95_ms": round(percentile_95(inference), 3),
+        "total_wall_time_ms": round(total_wall_time_ms, 3),
+        "wall_mean_ms": round(wall_mean, 3),
         "wall_median_ms": round(wall_median, 3),
         "wall_p95_ms": round(percentile_95(wall_ms), 3),
-        "end_to_end_fps": round(1000.0 / wall_median, 3) if wall_median > 0 else 0.0,
+        "measured_end_to_end_fps": round(measured_fps, 3),
+        "fps_from_median_wall_ms": round(fps_from_median, 3),
     }
+
+
+def uniform_frame_indices(total_frames: int, sample_count: int) -> list[int]:
+    """Deterministic unique frame indices spread across the video."""
+    if total_frames < 1:
+        raise ValueError("total_frames must be at least 1")
+    if sample_count < 1:
+        raise ValueError("sample_count must be at least 1")
+    count = min(sample_count, total_frames)
+    if count == 1:
+        return [0]
+    if count == total_frames:
+        return list(range(total_frames))
+    # Integer arithmetic guarantees unique, inclusive endpoints when count <= total.
+    return [((index * (total_frames - 1)) // (count - 1)) for index in range(count)]
+
+
+def sequential_frame_indices(total_frames: int, sample_count: int) -> list[int]:
+    if total_frames < 1:
+        raise ValueError("total_frames must be at least 1")
+    if sample_count < 1:
+        raise ValueError("sample_count must be at least 1")
+    return list(range(min(sample_count, total_frames)))
+
+
+def select_frame_indices(
+    total_frames: int,
+    sample_count: int,
+    *,
+    sampling: str = "uniform",
+) -> list[int]:
+    if sampling == "uniform":
+        return uniform_frame_indices(total_frames, sample_count)
+    if sampling == "sequential":
+        return sequential_frame_indices(total_frames, sample_count)
+    raise ValueError(f"sampling must be one of: {', '.join(SAMPLING_MODES)}")
 
 
 def bbox_iou(
@@ -238,19 +291,22 @@ def per_frame_parity(
 ) -> dict[str, float | int | bool]:
     matches = greedy_match_same_class(source, exported, iou_threshold=iou_threshold)
     both_empty = not source and not exported
-    mean_iou = sum(item[2] for item in matches) / len(matches) if matches else 0.0
-    mean_conf_diff = (
-        sum(abs(left.confidence - right.confidence) for left, right, _ in matches) / len(matches)
-        if matches
-        else 0.0
+    matched_iou_sum = sum(item[2] for item in matches)
+    matched_conf_diff_sum = sum(
+        abs(left.confidence - right.confidence) for left, right, _ in matches
     )
+    matched_count = len(matches)
     return {
         "source_detection_count": len(source),
         "exported_detection_count": len(exported),
-        "matched_detections": len(matches),
+        "matched_detections": matched_count,
         "both_empty": both_empty,
-        "mean_matched_iou": round(mean_iou, 4),
-        "mean_abs_confidence_difference": round(mean_conf_diff, 4),
+        "matched_iou_sum": round(matched_iou_sum, 6),
+        "matched_confidence_difference_sum": round(matched_conf_diff_sum, 6),
+        "mean_matched_iou": round(matched_iou_sum / matched_count, 4) if matched_count else 0.0,
+        "mean_abs_confidence_difference": (
+            round(matched_conf_diff_sum / matched_count, 4) if matched_count else 0.0
+        ),
     }
 
 
@@ -259,31 +315,53 @@ def aggregate_parity(frame_results: list[dict[str, float | int | bool]]) -> dict
     exported_total = sum(int(item["exported_detection_count"]) for item in frame_results)
     matched_total = sum(int(item["matched_detections"]) for item in frame_results)
     both_empty_frames = sum(1 for item in frame_results if item["both_empty"])
-    iou_values = [
-        float(item["mean_matched_iou"])
-        for item in frame_results
-        if int(item["matched_detections"]) > 0
-    ]
-    conf_values = [
-        float(item["mean_abs_confidence_difference"])
-        for item in frame_results
-        if int(item["matched_detections"]) > 0
-    ]
+    total_matched_iou = sum(float(item.get("matched_iou_sum", 0.0)) for item in frame_results)
+    total_conf_diff = sum(
+        float(item.get("matched_confidence_difference_sum", 0.0)) for item in frame_results
+    )
     return {
         "frames_compared": len(frame_results),
         "source_detection_count": source_total,
         "exported_detection_count": exported_total,
         "matched_detections": matched_total,
+        "matched_iou_sum": round(total_matched_iou, 6),
+        "matched_confidence_difference_sum": round(total_conf_diff, 6),
         "source_match_recall": round(matched_total / source_total, 4) if source_total else 0.0,
         "exported_match_precision": round(matched_total / exported_total, 4)
         if exported_total
         else 0.0,
-        "mean_matched_iou": round(sum(iou_values) / len(iou_values), 4) if iou_values else 0.0,
-        "mean_abs_confidence_difference": round(sum(conf_values) / len(conf_values), 4)
-        if conf_values
-        else 0.0,
+        "mean_matched_iou": (
+            round(total_matched_iou / matched_total, 4) if matched_total else 0.0
+        ),
+        "mean_abs_confidence_difference": (
+            round(total_conf_diff / matched_total, 4) if matched_total else 0.0
+        ),
         "both_empty_frames": both_empty_frames,
     }
+
+
+def detect_raspberry_pi(
+    *,
+    model_path: Path = DEVICE_TREE_MODEL_PATH,
+    system_name: str | None = None,
+) -> dict[str, Any]:
+    """Conservatively detect Raspberry Pi from device-tree model text."""
+    system = system_name if system_name is not None else platform.system()
+    result: dict[str, Any] = {
+        "raspberry_pi_benchmarked": False,
+        "device_model": None,
+    }
+    if system != "Linux":
+        return result
+    try:
+        raw = model_path.read_bytes()
+    except (FileNotFoundError, PermissionError, OSError):
+        return result
+    text = raw.split(b"\x00", 1)[0].decode("utf-8", errors="ignore").strip()
+    result["device_model"] = text or None
+    if text and "raspberry pi" in text.lower():
+        result["raspberry_pi_benchmarked"] = True
+    return result
 
 
 def collect_runtime_provenance(
@@ -294,8 +372,10 @@ def collect_runtime_provenance(
     ultralytics_version: str,
     torch_version: str,
     onnxruntime_version: str | None,
+    raspberry_pi_info: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     operating_system = f"{platform.system()} {platform.release()}"
+    pi_info = raspberry_pi_info if raspberry_pi_info is not None else detect_raspberry_pi()
     return {
         "operating_system": operating_system,
         "machine_architecture": platform.machine(),
@@ -309,12 +389,32 @@ def collect_runtime_provenance(
         "model_image_size": imgsz,
         "benchmark_configuration": benchmark_config,
         "hardware_scope": "current_machine_only",
-        "raspberry_pi_benchmarked": False,
+        "raspberry_pi_benchmarked": bool(pi_info["raspberry_pi_benchmarked"]),
+        "device_model": pi_info.get("device_model"),
     }
 
 
 def validation_not_run() -> dict[str, Any]:
     return {"status": "not_run"}
+
+
+def package_validation_metrics(
+    source_metrics: dict[str, float],
+    exported_metrics: dict[str, float],
+) -> dict[str, Any]:
+    differences: dict[str, dict[str, float]] = {}
+    for key in source_metrics:
+        signed = round(exported_metrics[key] - source_metrics[key], 4)
+        differences[key] = {
+            "signed_difference": signed,
+            "absolute_difference": round(abs(signed), 4),
+        }
+    return {
+        "status": "completed",
+        "source": source_metrics,
+        "exported": exported_metrics,
+        "differences": differences,
+    }
 
 
 def build_optimization_report(
@@ -336,6 +436,7 @@ def build_optimization_report(
         int(source_artifact["total_bytes"]),
         int(exported_artifact["total_bytes"]),
     )
+    raspberry_pi = bool(runtime_provenance.get("raspberry_pi_benchmarked", False))
     return {
         "schema_version": SCHEMA_VERSION,
         "generated_at_utc": datetime.now(UTC).replace(microsecond=0).isoformat().replace(
@@ -356,15 +457,17 @@ def build_optimization_report(
         "prediction_parity": prediction_parity,
         "validation": validation,
         "limitations": limitations,
-        "raspberry_pi_benchmarked": False,
+        "raspberry_pi_benchmarked": raspberry_pi,
     }
 
 
 REPORT_LIMITATIONS = [
-    "Benchmarks run on the current machine only; not Raspberry Pi results.",
+    "Benchmarks apply only to the current machine (hardware_scope).",
     "Backend inference timings come from Ultralytics result.speed.",
-    "End-to-end FPS is measured from prediction-call wall time on sampled frames.",
-    "Prediction parity compares postprocessed detections; not validation accuracy.",
-    "Empty-vs-empty frames are reported separately and do not prove model quality.",
-    "FP16 or INT8 speedups must be read from measured numbers in this report.",
+    "measured_end_to_end_fps uses total wall time across timed samples.",
+    "fps_from_median_wall_ms is median-derived theoretical throughput only.",
+    "Prediction parity is not validation accuracy.",
+    "A single matched detection is insufficient parity evidence.",
+    "Empty-vs-empty frames do not prove model quality.",
+    "FP16 or INT8 speedups must be read from measured numbers.",
 ]

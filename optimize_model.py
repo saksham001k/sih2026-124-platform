@@ -16,8 +16,11 @@ from urban_intelligence.optimization import (
     artifact_record,
     build_optimization_report,
     collect_runtime_provenance,
+    detect_raspberry_pi,
+    package_validation_metrics,
     per_frame_parity,
     quantize_for_precision,
+    select_frame_indices,
     summarize_timings,
     validate_benchmark_settings,
     validation_not_run,
@@ -34,6 +37,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--imgsz", type=int, default=640)
     parser.add_argument("--warmup-runs", type=int, default=5)
     parser.add_argument("--benchmark-frames", type=int, default=50)
+    parser.add_argument(
+        "--sampling",
+        choices=("uniform", "sequential"),
+        default="uniform",
+        help="Video frame sampling strategy (default: uniform across the whole video)",
+    )
     parser.add_argument("--confidence", type=float, default=0.25)
     parser.add_argument("--iou", type=float, default=0.70)
     parser.add_argument(
@@ -70,35 +79,112 @@ def resolve_precision(args: argparse.Namespace) -> str:
     return args.precision
 
 
-def load_benchmark_frames(source: Path, frame_count: int) -> list[Any]:
+def load_benchmark_frames(
+    source: Path,
+    frame_count: int,
+    *,
+    sampling: str = "uniform",
+) -> dict[str, Any]:
+    """Load unique source frames for parity and reusable timed benchmarking."""
     import cv2
 
     if not source.is_file():
         raise SystemExit(f"Benchmark source not found: {source}")
 
-    if source.suffix.lower() in {".jpg", ".jpeg", ".png", ".bmp", ".webp"}:
+    image_suffixes = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
+    if source.suffix.lower() in image_suffixes:
         image = cv2.imread(str(source))
         if image is None:
             raise SystemExit(f"Unable to read benchmark image: {source}")
-        return [image]
+        return {
+            "frames": [image],
+            "sampled_frame_indices": [0],
+            "source_total_frames": 1,
+            "unique_frames_loaded": 1,
+            "source_kind": "image",
+            "sampling": "image",
+        }
 
     capture = cv2.VideoCapture(str(source))
     if not capture.isOpened():
         raise SystemExit(f"Unable to open benchmark video: {source}")
 
-    frames: list[Any] = []
     try:
-        while len(frames) < frame_count:
+        reported_total = int(capture.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+        if sampling == "sequential" or reported_total <= 0:
+            frames: list[Any] = []
+            indices: list[int] = []
+            frame_index = 0
+            while len(frames) < frame_count:
+                ok, frame = capture.read()
+                if not ok:
+                    break
+                frames.append(frame)
+                indices.append(frame_index)
+                frame_index += 1
+            if not frames:
+                raise SystemExit(f"No frames could be read from benchmark source: {source}")
+            total_frames = reported_total if reported_total > 0 else len(frames)
+            return {
+                "frames": frames,
+                "sampled_frame_indices": indices,
+                "source_total_frames": total_frames,
+                "unique_frames_loaded": len(frames),
+                "source_kind": "video",
+                "sampling": "sequential",
+            }
+
+        indices = select_frame_indices(reported_total, frame_count, sampling=sampling)
+        frames_by_index: dict[int, Any] = {}
+        needed = set(indices)
+        current = 0
+        while needed and current < reported_total:
             ok, frame = capture.read()
             if not ok:
                 break
-            frames.append(frame)
+            if current in needed:
+                frames_by_index[current] = frame
+                needed.remove(current)
+            current += 1
+
+        actual_total = current
+        # OpenCV often overstates CAP_PROP_FRAME_COUNT; re-sample from readable length.
+        if needed and actual_total > 0:
+            capture.release()
+            capture = cv2.VideoCapture(str(source))
+            if not capture.isOpened():
+                raise SystemExit(f"Unable to reopen benchmark video: {source}")
+            indices = select_frame_indices(actual_total, frame_count, sampling=sampling)
+            frames_by_index = {}
+            needed = set(indices)
+            current = 0
+            while needed and current < actual_total:
+                ok, frame = capture.read()
+                if not ok:
+                    break
+                if current in needed:
+                    frames_by_index[current] = frame
+                    needed.remove(current)
+                current += 1
+            reported_total = actual_total
+
+        if not frames_by_index:
+            raise SystemExit(f"No frames could be read from benchmark source: {source}")
+
+        available_indices = [index for index in indices if index in frames_by_index]
+        if not available_indices:
+            raise SystemExit(f"Unable to load sampled frames from: {source}")
+        frames = [frames_by_index[index] for index in available_indices]
+        return {
+            "frames": frames,
+            "sampled_frame_indices": available_indices,
+            "source_total_frames": reported_total,
+            "unique_frames_loaded": len(frames),
+            "source_kind": "video",
+            "sampling": sampling,
+        }
     finally:
         capture.release()
-
-    if not frames:
-        raise SystemExit(f"No frames could be read from benchmark source: {source}")
-    return frames
 
 
 def extract_parity_detections(result) -> list[ParityDetection]:
@@ -117,7 +203,12 @@ def extract_parity_detections(result) -> list[ParityDetection]:
                 class_id=class_index,
                 class_name=str(names.get(class_index, class_index)),
                 confidence=float(confidence),
-                bbox=(float(coords[0]), float(coords[1]), float(coords[2]), float(coords[3])),
+                bbox=(
+                    float(coords[0]),
+                    float(coords[1]),
+                    float(coords[2]),
+                    float(coords[3]),
+                ),
             )
         )
     return detections
@@ -177,11 +268,11 @@ def compare_prediction_parity(
     confidence: float,
     iou: float,
     device: str,
-    frame_count: int,
+    sampled_frame_indices: list[int],
 ) -> dict[str, Any]:
+    """Compare each unique loaded frame once."""
     frame_results: list[dict[str, float | int | bool]] = []
-    for index in range(frame_count):
-        frame = frames[index % len(frames)]
+    for frame in frames:
         source_result = run_predict(
             source_model, frame, imgsz=imgsz, confidence=confidence, iou=iou, device=device
         )[0]
@@ -195,9 +286,10 @@ def compare_prediction_parity(
             )
         )
     aggregated = aggregate_parity(frame_results)
+    aggregated["sampled_frame_indices"] = sampled_frame_indices
     aggregated["note"] = (
-        "prediction_parity compares postprocessed detections on the same frames; "
-        "it is not a validation accuracy claim"
+        "prediction_parity compares postprocessed detections on unique sampled frames; "
+        "it is not a validation accuracy claim. A single matched detection is weak evidence."
     )
     return aggregated
 
@@ -212,33 +304,20 @@ def run_optional_validation(model, validation_data: str, device: str) -> dict[st
     }
 
 
-def package_validation(
-    source_metrics: dict[str, float] | None,
-    exported_metrics: dict[str, float] | None,
-) -> dict[str, Any]:
-    if source_metrics is None or exported_metrics is None:
-        return validation_not_run()
-    differences = {
-        key: round(exported_metrics[key] - source_metrics[key], 4)
-        for key in source_metrics
-    }
-    return {
-        "status": "completed",
-        "source": source_metrics,
-        "exported": exported_metrics,
-        "differences": differences,
-    }
-
-
 def export_model(
     model,
     *,
     export_format: str,
     precision: str,
     imgsz: int,
+    device: str,
     calibration_data: str | None,
 ) -> Path:
-    export_kwargs: dict[str, Any] = {"format": export_format, "imgsz": imgsz}
+    export_kwargs: dict[str, Any] = {
+        "format": export_format,
+        "imgsz": imgsz,
+        "device": device,
+    }
     quantize = quantize_for_precision(precision)
     if quantize is not None:
         export_kwargs["quantize"] = quantize
@@ -267,12 +346,19 @@ def main() -> None:
 
     if not source_path.is_file():
         raise SystemExit(f"Model not found: {source_path}")
+    if not source_media.is_file():
+        raise SystemExit(f"Benchmark source not found: {source_media}")
 
     calibration_data = args.data
     if precision == "int8" and calibration_data:
         calibration_path = Path(calibration_data)
         if not calibration_path.is_file():
             raise SystemExit(f"Calibration YAML not found: {calibration_path}")
+
+    if args.validation_data:
+        validation_path = Path(args.validation_data)
+        if not validation_path.is_file():
+            raise SystemExit(f"Validation YAML not found: {validation_path}")
 
     try:
         validate_benchmark_settings(
@@ -285,6 +371,7 @@ def main() -> None:
             calibration_data=calibration_data,
             precision=precision,
             export_format=args.format,
+            sampling=args.sampling,
         )
     except ValueError as exc:
         raise SystemExit(str(exc)) from exc
@@ -294,13 +381,19 @@ def main() -> None:
     except ImportError as exc:
         raise SystemExit("Install dependencies with: pip install -r requirements.txt") from exc
 
-    frames = load_benchmark_frames(source_media, args.benchmark_frames)
+    frame_bundle = load_benchmark_frames(
+        source_media,
+        args.benchmark_frames,
+        sampling=args.sampling,
+    )
+    frames = frame_bundle["frames"]
     source_model = YOLO(str(source_path))
     export_arguments = {
         "format": args.format,
         "imgsz": args.imgsz,
         "precision": precision,
         "quantize": quantize_for_precision(precision),
+        "device": args.device,
     }
     if precision == "int8":
         export_arguments["data"] = calibration_data
@@ -310,12 +403,18 @@ def main() -> None:
         export_format=args.format,
         precision=precision,
         imgsz=args.imgsz,
+        device=args.device,
         calibration_data=calibration_data,
     )
     exported_model = YOLO(str(exported_path))
 
     benchmark_configuration = {
         "source_media": str(source_media),
+        "source_kind": frame_bundle["source_kind"],
+        "sampling": frame_bundle["sampling"],
+        "source_total_frames": frame_bundle["source_total_frames"],
+        "unique_frames_loaded": frame_bundle["unique_frames_loaded"],
+        "sampled_frame_indices": frame_bundle["sampled_frame_indices"],
         "warmup_runs": args.warmup_runs,
         "benchmark_frames": args.benchmark_frames,
         "confidence": args.confidence,
@@ -352,22 +451,20 @@ def main() -> None:
         confidence=args.confidence,
         iou=args.iou,
         device=args.device,
-        frame_count=args.benchmark_frames,
+        sampled_frame_indices=frame_bundle["sampled_frame_indices"],
     )
 
     validation = validation_not_run()
     if args.validation_data:
-        validation_path = Path(args.validation_data)
-        if not validation_path.is_file():
-            raise SystemExit(f"Validation YAML not found: {validation_path}")
         source_metrics = run_optional_validation(
-            source_model, str(validation_path), args.device
+            source_model, str(Path(args.validation_data)), args.device
         )
         exported_metrics = run_optional_validation(
-            exported_model, str(validation_path), args.device
+            exported_model, str(Path(args.validation_data)), args.device
         )
-        validation = package_validation(source_metrics, exported_metrics)
+        validation = package_validation_metrics(source_metrics, exported_metrics)
 
+    raspberry_pi_info = detect_raspberry_pi()
     onnxruntime_version = get_package_version("onnxruntime")
     runtime_provenance = collect_runtime_provenance(
         device=args.device,
@@ -375,7 +472,10 @@ def main() -> None:
         benchmark_config=benchmark_configuration,
         ultralytics_version=get_package_version("ultralytics"),
         torch_version=get_package_version("torch"),
-        onnxruntime_version=None if onnxruntime_version == "not_installed" else onnxruntime_version,
+        onnxruntime_version=(
+            None if onnxruntime_version == "not_installed" else onnxruntime_version
+        ),
+        raspberry_pi_info=raspberry_pi_info,
     )
 
     report = build_optimization_report(

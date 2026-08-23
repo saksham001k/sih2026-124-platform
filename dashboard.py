@@ -368,6 +368,7 @@ def render_edge_benchmark_section(report_path: Path) -> None:
             "  --precision fp32 \\\n"
             "  --source clips/1.mp4 \\\n"
             "  --device cpu \\\n"
+            "  --sampling uniform \\\n"
             "  --warmup-runs 5 \\\n"
             "  --benchmark-frames 50 \\\n"
             "  --report artifacts/edge_bench/road_hazards_onnx_fp32.json\n"
@@ -392,14 +393,18 @@ def render_edge_benchmark_section(report_path: Path) -> None:
     exported_bench = report.get("exported_benchmark", {})
     parity = report.get("prediction_parity", {})
     validation = report.get("validation", {"status": "not_run"})
+    config = report.get("benchmark_configuration", {})
+
+    change_label = comparison.get("change_label", "size_reduction")
+    change_percent = float(comparison.get("change_percent", 0))
+    size_metric_label = (
+        "Size increase" if change_label == "size_increase" else "Size reduction"
+    )
 
     row_one = st.columns(3)
     row_one[0].metric("Source size (MiB)", f"{float(source.get('mib', 0)):.2f}")
     row_one[1].metric("Exported size (MiB)", f"{float(exported.get('mib', 0)):.2f}")
-    row_one[2].metric(
-        "Size reduction",
-        f"{float(comparison.get('reduction_percent', 0)):.1f}%",
-    )
+    row_one[2].metric(size_metric_label, f"{change_percent:.1f}%")
 
     row_two = st.columns(3)
     row_two[0].metric(
@@ -409,11 +414,34 @@ def render_edge_benchmark_section(report_path: Path) -> None:
         "Exported wall P95 (ms)", f"{float(exported_bench.get('wall_p95_ms', 0)):.1f}"
     )
     row_two[2].metric(
-        "Exported end-to-end FPS", f"{float(exported_bench.get('end_to_end_fps', 0)):.1f}"
+        "Exported measured FPS",
+        f"{float(exported_bench.get('measured_end_to_end_fps', 0)):.1f}",
+    )
+
+    st.caption(
+        "Measured FPS = timed samples / total wall time. "
+        f"Median-derived theoretical FPS (not measured throughput): "
+        f"{float(exported_bench.get('fps_from_median_wall_ms', 0)):.1f}."
+    )
+    st.caption(
+        f"Sampling: {config.get('sampling', 'unknown')} · "
+        f"unique frames: {config.get('unique_frames_loaded', 0)} / "
+        f"{config.get('source_total_frames', 0)}"
     )
 
     st.subheader("Prediction parity")
-    st.caption(parity.get("note", "Prediction parity is not validation accuracy."))
+    st.caption(
+        parity.get(
+            "note",
+            "Prediction parity is not validation accuracy. "
+            "A single matched detection is insufficient evidence.",
+        )
+    )
+    if int(parity.get("matched_detections", 0)) <= 1:
+        st.warning(
+            "Matched detections are too few for strong parity evidence. "
+            "This is not validation accuracy."
+        )
     parity_cols = st.columns(4)
     parity_cols[0].metric("Frames compared", int(parity.get("frames_compared", 0)))
     parity_cols[1].metric("Matched detections", int(parity.get("matched_detections", 0)))

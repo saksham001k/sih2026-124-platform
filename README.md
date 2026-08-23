@@ -287,6 +287,7 @@ python optimize_model.py \
   --source clips/1.mp4 \
   --device cpu \
   --imgsz 640 \
+  --sampling uniform \
   --warmup-runs 5 \
   --benchmark-frames 50 \
   --confidence 0.25 \
@@ -303,6 +304,7 @@ python optimize_model.py \
   --precision fp16 \
   --source clips/1.mp4 \
   --device cpu \
+  --sampling uniform \
   --report artifacts/edge_bench/road_hazards_ncnn_fp16.json
 ```
 
@@ -310,9 +312,13 @@ INT8 ONNX export requires representative calibration YAML via `--data`. NCNN INT
 Deprecated `--int8` maps to `--precision int8`.
 
 Reports include measured artifact sizes, SHA-256 hashes, inference and wall-time latency,
-end-to-end FPS, prediction parity and optional validation metrics. Benchmarks from a laptop or
-desktop set `raspberry_pi_benchmarked: false` and must not be presented as Raspberry Pi results.
-Run the same command on the target device before making edge performance claims.
+`measured_end_to_end_fps` (samples / total wall time), prediction parity and optional validation
+metrics. Videos default to deterministic uniform sampling across the whole clip. Prediction
+parity is not validation accuracy; a single matched detection is weak evidence.
+
+`raspberry_pi_benchmarked` is detected automatically from Linux device-tree text when available
+and is never set by a CLI override. Mac/desktop runs remain `false`. Even on a Pi, results apply
+only to that machine (`hardware_scope: current_machine_only`).
 
 View reports in the dashboard **Edge benchmark** tab.
 
