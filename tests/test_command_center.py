@@ -1,6 +1,6 @@
 import json
 
-from urban_intelligence.command_center import build_operational_scene
+from urban_intelligence.command_center import build_operational_scene, filter_scene_at
 
 
 def test_builds_all_operational_layers_and_centres_on_route() -> None:
@@ -118,3 +118,32 @@ def test_timeline_is_sorted_and_preserves_evidence_references() -> None:
     ]
     assert scene["timeline"][0]["evidence_crop"].endswith("crop.jpg")
     assert scene["timeline"][1]["evidence_frame"].endswith("frame.jpg")
+
+
+def test_scene_replay_filters_route_and_events_by_time() -> None:
+    scene = build_operational_scene(
+        route_records=[
+            {"timestamp_s": 0, "lat": 28.60, "lon": 77.20},
+            {"timestamp_s": 5, "lat": 28.61, "lon": 77.21},
+            {"timestamp_s": 10, "lat": 28.62, "lon": 77.22},
+        ],
+        road_events=[
+            {
+                "event_id": "early",
+                "video_time_s": 3,
+                "lat": 28.605,
+                "lon": 77.205,
+            },
+            {
+                "event_id": "late",
+                "video_time_s": 9,
+                "lat": 28.615,
+                "lon": 77.215,
+            },
+        ],
+    )
+
+    replay = filter_scene_at(scene, 5)
+    assert replay["route"] == [[77.2, 28.6], [77.21, 28.61]]
+    assert [item["id"] for item in replay["hazards"]] == ["early"]
+    assert replay["counts"]["hazards"] == 1

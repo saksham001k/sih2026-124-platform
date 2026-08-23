@@ -14,6 +14,7 @@ from urban_intelligence.demo_jobs import (
     load_manifest,
     modules_for_profile,
     prepare_run,
+    quality_profile_settings,
     run_analysis,
     validate_upload,
 )
@@ -39,6 +40,16 @@ def test_scan_profiles_are_stable_and_custom_is_ordered() -> None:
     assert modules_for_profile("quick") == ("road", "traffic")
     assert modules_for_profile("full") == ("road", "traffic", "assets", "anpr")
     assert modules_for_profile("custom", ("anpr", "road")) == ("road", "anpr")
+
+
+def test_quality_profiles_make_recall_precision_tradeoff_explicit() -> None:
+    recall = quality_profile_settings("high_recall")
+    strict = quality_profile_settings("strict")
+    assert recall["road_confidence"] < strict["road_confidence"]
+    assert recall["road_image_size"] > strict["road_image_size"]
+    assert recall["road_min_hits"] < strict["road_min_hits"]
+    with pytest.raises(ValueError, match="quality profile"):
+        quality_profile_settings("perfect")
 
 
 def test_incident_correlation_links_masked_anpr_only(tmp_path: Path) -> None:
@@ -141,6 +152,7 @@ def test_prepare_run_uses_safe_names_and_real_gps(tmp_path: Path) -> None:
     assert manifest["input"]["video"]["original_name"] == "incident.mp4"
     assert manifest["input"]["gps"]["original_name"] == "telemetry.csv"
     assert manifest["gps_source_type"] == "real_telemetry"
+    assert manifest["quality_profile"] == "high_recall"
     assert set(manifest["stages"]) == {"road", "traffic"}
 
 

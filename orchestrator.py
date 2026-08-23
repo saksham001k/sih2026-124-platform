@@ -63,6 +63,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--window-size", type=int, default=5)
     parser.add_argument("--min-hits", type=int, default=3)
     parser.add_argument("--dedupe-radius-m", type=float, default=12.0)
+    parser.add_argument("--image-size", type=int, default=640)
+    parser.add_argument("--inference-iou", type=float, default=0.70)
+    parser.add_argument("--augment", action="store_true")
+    parser.add_argument("--road-roi-top", type=float, default=0.30)
     parser.add_argument(
         "--classes",
         default="",
@@ -81,6 +85,31 @@ def percentile_95(values: list[float]) -> float:
 
 def directory_size(path: Path) -> int:
     return sum(item.stat().st_size for item in path.rglob("*") if item.is_file())
+
+
+def road_detection_geometry_is_plausible(
+    bbox: tuple[int, int, int, int],
+    *,
+    frame_width: int,
+    frame_height: int,
+    roi_top: float = 0.30,
+    min_area_ratio: float = 0.00002,
+    max_area_ratio: float = 0.45,
+) -> bool:
+    """Keep road-surface proposals in a configurable lower-frame region."""
+    if frame_width <= 0 or frame_height <= 0:
+        return False
+    x1, y1, x2, y2 = bbox
+    width = x2 - x1
+    height = y2 - y1
+    if width <= 0 or height <= 0:
+        return False
+    center_y = (y1 + y2) / 2
+    area_ratio = (width * height) / (frame_width * frame_height)
+    return (
+        center_y >= frame_height * roi_top
+        and min_area_ratio <= area_ratio <= max_area_ratio
+    )
 
 
 def write_csv(path: Path, rows: list[dict[str, Any]], columns: list[str]) -> None:
@@ -123,6 +152,11 @@ def run_pipeline(
     min_hits: int = 3,
     dedupe_radius_m: float = 12.0,
     classes: str = "",
+    image_size: int = 640,
+    inference_iou: float = 0.70,
+    augment: bool = False,
+    road_roi_top: float = 0.30,
+    quality_profile: str = "custom",
 ) -> dict[str, Any]:
     """Run road perception and return the metrics written to ``output_dir``.
 
@@ -139,6 +173,12 @@ def run_pipeline(
         raise ValueError("confidence must be between 0 and 1")
     if dedupe_radius_m < 0:
         raise ValueError("dedupe_radius_m must not be negative")
+    if image_size < 160:
+        raise ValueError("image_size must be at least 160")
+    if not 0.0 <= inference_iou <= 1.0:
+        raise ValueError("inference_iou must be between 0 and 1")
+    if not 0.0 <= road_roi_top < 1.0:
+        raise ValueError("road_roi_top must be between 0 and 1")
 
     try:
         import cv2
@@ -183,6 +223,8 @@ def run_pipeline(
     inference_times_ms: list[float] = []
     frame_index = 0
     processed_frames = 0
+    model_proposals = 0
+    geometry_rejections = 0
     start = time.perf_counter()
 
     try:
@@ -198,13 +240,16 @@ def run_pipeline(
                 results = model.track(
                     frame,
                     conf=confidence,
+                    iou=inference_iou,
+                    imgsz=image_size,
+                    augment=augment,
                     persist=True,
                     tracker="bytetrack.yaml",
                     verbose=False,
                 )
                 inference_times_ms.append((time.perf_counter() - inference_start) * 1000)
                 result = results[0]
-                annotated = result.plot()
+                annotated = frame.copy()
                 location = gps_track.for_frame(frame_index, source_fps)
                 frame_detections: list[Detection] = []
 
@@ -214,14 +259,23 @@ def run_pipeline(
                         class_name = normalize_class_name(str(model.names[class_id]))
                         if not class_matches_filter(class_name, allowed_classes):
                             continue
-                        confidence = float(box.conf[0])
+                        model_proposals += 1
+                        detection_confidence = float(box.conf[0])
                         x1, y1, x2, y2 = map(int, box.xyxy[0].tolist())
+                        if not road_detection_geometry_is_plausible(
+                            (x1, y1, x2, y2),
+                            frame_width=width,
+                            frame_height=height,
+                            roi_top=road_roi_top,
+                        ):
+                            geometry_rejections += 1
+                            continue
                         track_id = int(box.id[0]) if box.id is not None else None
                         detection = Detection(
                             frame_index=frame_index,
                             video_time_s=frame_index / source_fps,
                             class_name=class_name,
-                            confidence=confidence,
+                            confidence=detection_confidence,
                             bbox=(x1, y1, x2, y2),
                             latitude=location.latitude,
                             longitude=location.longitude,
@@ -234,7 +288,7 @@ def run_pipeline(
                                 "video_time_s": round(detection.video_time_s, 3),
                                 "track_id": "" if track_id is None else track_id,
                                 "class": class_name,
-                                "confidence": round(confidence, 4),
+                                "confidence": round(detection_confidence, 4),
                                 "x1": x1,
                                 "y1": y1,
                                 "x2": x2,
@@ -242,6 +296,17 @@ def run_pipeline(
                                 "lat": round(location.latitude, 7),
                                 "lon": round(location.longitude, 7),
                             }
+                        )
+                        cv2.rectangle(annotated, (x1, y1), (x2, y2), (44, 220, 196), 2)
+                        cv2.putText(
+                            annotated,
+                            f"{class_name} {detection_confidence:.2f}",
+                            (x1, max(22, y1 - 8)),
+                            cv2.FONT_HERSHEY_SIMPLEX,
+                            0.55,
+                            (44, 220, 196),
+                            2,
+                            cv2.LINE_AA,
                         )
 
                 for confirmation in temporal_filter.update(frame_detections):
@@ -312,6 +377,13 @@ def run_pipeline(
         "source_fps": round(source_fps, 3),
         "processed_frames": processed_frames,
         "frame_skip": frame_skip,
+        "quality_profile": quality_profile,
+        "image_size": image_size,
+        "test_time_augmentation": augment,
+        "inference_iou": inference_iou,
+        "road_roi_top": road_roi_top,
+        "model_proposals": model_proposals,
+        "geometry_rejections": geometry_rejections,
         "detections": len(detections),
         "confirmed_events": len(events),
         "wall_time_s": round(elapsed_s, 3),
@@ -344,6 +416,10 @@ def main() -> None:
             min_hits=args.min_hits,
             dedupe_radius_m=args.dedupe_radius_m,
             classes=args.classes,
+            image_size=args.image_size,
+            inference_iou=args.inference_iou,
+            augment=args.augment,
+            road_roi_top=args.road_roi_top,
         )
     except ValueError as exc:
         raise SystemExit(str(exc)) from exc

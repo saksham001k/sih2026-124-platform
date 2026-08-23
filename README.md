@@ -85,7 +85,7 @@ The command centre can now create an isolated analysis session directly from a b
    (road + traffic + assets + ANPR),
    or a custom module combination.
 5. Pass the displayed model/runtime preflight and click **Run DrishtiPath Scan**.
-6. Review every successful module in the result tabs. A failed module does not discard
+6. Review every successful module from **Mission control** or **Evidence review**. A failed module does not discard
    evidence produced by the other modules.
 
 Dashboard runs are stored under `artifacts/ui_runs/<run-id>/` with safe generated input names,
@@ -113,6 +113,34 @@ uses Carto basemap tiles and therefore benefits from internet access. Select
 **Offline-safe 3D** to use the tile-free Plotly renderer during unreliable venue connectivity.
 Both renderers use the same tested, normalized scene data. Complete plate text is never copied
 into the command-centre scene or timeline.
+
+The presentation workspace is intentionally task-oriented instead of exposing ten permanent
+tabs. Use **New scan**, **Mission control**, **Evidence review**, and **Operations**; disable
+Presentation mode only when edge engineering diagnostics are needed. Mission control includes
+an interactive time scrubber that replays the route and reveals only intelligence available at
+that moment.
+
+Use [`docs/PRESENTATION_RUNBOOK.md`](docs/PRESENTATION_RUNBOOK.md) for the venue checklist,
+three-minute demo flow, frozen negative-clip regression and judge-safe claims.
+
+### Accuracy and review profiles
+
+The upload workflow exposes three explicit road-analysis policies:
+
+| Policy | Purpose | Road settings |
+|---|---|---|
+| High recall | Search harder for small/missed hazards | 768 px, test-time augmentation, 2-in-7 temporal gate |
+| Balanced | General demonstration | 704 px, 3-in-5 temporal gate |
+| Strict review | Minimize review volume | Higher detector threshold, 640 px, 3-in-5 gate |
+
+High recall is not “perfect accuracy.” Every confirmed hazard remains pending review. The
+dashboard separates **model proposals**, **quality-eligible observations**, and **confirmed
+hazards** so raw boxes are never presented as verified city defects.
+
+Evidence review now records `confirmed`, `rejected_false_positive`, or
+`needs_field_inspection` decisions in an atomic `review_feedback.json`. Rejected zebra paint,
+shadows, road repairs, and other lookalikes are exported as hard-negative feedback for the next
+training cycle without modifying the original model output.
 
 ## Use a road-hazard model
 
@@ -233,6 +261,11 @@ DrishtiPath integrates **MIT-licensed FastALPR** ONNX detection and OCR as the d
 runtime. The pipeline performs multi-frame plate tracking, exact OCR consensus, timestamp-based
 GPS attachment, and masked console output. Evidence files are written locally for authorized
 human review only.
+
+Raw detector output is labelled **plate-like proposals**, never “number plates.” A review event
+is created only after detector confidence, crop size/shape, spatial track consistency, exact OCR
+vote ratio, mean OCR confidence, mean detector confidence, and Indian/Bharat format gates pass.
+A clip with proposals but no confirmed track is reported as **No verified plate evidence**.
 
 ### Install
 

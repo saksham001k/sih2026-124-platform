@@ -78,7 +78,7 @@ def _scene_center(coordinates: Sequence[tuple[float, float]]) -> dict[str, float
     }
 
 
-def _route_points(records: Sequence[Mapping[str, Any]]) -> list[list[float]]:
+def _timed_route_points(records: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
     timed_points: list[tuple[float, list[float]]] = []
     seen: set[tuple[float, float]] = set()
     for index, record in enumerate(records):
@@ -96,7 +96,14 @@ def _route_points(records: Sequence[Mapping[str, Any]]) -> list[list[float]]:
         )
         timed_points.append((timestamp, [longitude, latitude]))
     timed_points.sort(key=lambda item: item[0])
-    return [position for _, position in timed_points]
+    return [
+        {"time_s": timestamp, "position": position}
+        for timestamp, position in timed_points
+    ]
+
+
+def _route_points(records: Sequence[Mapping[str, Any]]) -> list[list[float]]:
+    return [item["position"] for item in _timed_route_points(records)]
 
 
 def _hazard_points(records: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
@@ -115,6 +122,7 @@ def _hazard_points(records: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]
                 "kind": "Road hazard",
                 "label": class_name.replace("_", " ").title(),
                 "position": [longitude, latitude],
+                "time_s": _number(record.get("video_time_s")),
                 "confidence": confidence,
                 "confidence_label": f"{confidence * 100:.1f}%",
                 "observations": observations,
@@ -147,6 +155,9 @@ def _traffic_points(records: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]
                 "kind": "Traffic window",
                 "label": f"{vehicles:.1f} vehicles · {occupancy * 100:.1f}% occupancy",
                 "position": [longitude, latitude],
+                "time_s": _number(
+                    record.get("midpoint_time_s", record.get("start_time_s"))
+                ),
                 "occupancy": occupancy,
                 "vehicles": vehicles,
                 "elevation": 15 + (occupancy * 260) + min(vehicles, 20) * 6,
@@ -173,6 +184,7 @@ def _bottleneck_points(records: Sequence[Mapping[str, Any]]) -> list[dict[str, A
                 "kind": "Bottleneck",
                 "label": f"{vehicles:.1f} vehicles · {occupancy * 100:.1f}% occupancy",
                 "position": [longitude, latitude],
+                "time_s": _number(record.get("start_time_s")),
                 "elevation": 220,
                 "radius": 26,
                 "color": [255, 49, 72, 235],
@@ -197,6 +209,7 @@ def _anpr_points(records: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
                 "kind": "ANPR evidence",
                 "label": masked_plate,
                 "position": [longitude, latitude],
+                "time_s": _number(record.get("first_video_time_s")),
                 "elevation": 105,
                 "radius": 19,
                 "color": [70, 155, 255, 235],
@@ -265,7 +278,8 @@ def build_operational_scene(
     anpr_events: Sequence[Mapping[str, Any]] = (),
 ) -> dict[str, Any]:
     """Normalize module outputs into one privacy-safe 3D operational scene."""
-    route = _route_points(route_records)
+    route_timed = _timed_route_points(route_records)
+    route = [item["position"] for item in route_timed]
     hazards = _hazard_points(road_events)
     traffic = _traffic_points(traffic_windows)
     bottlenecks = _bottleneck_points(bottleneck_events)
@@ -282,6 +296,7 @@ def build_operational_scene(
     return {
         "center": _scene_center(coordinates),
         "route": route,
+        "route_timed": route_timed,
         "hazards": hazards,
         "traffic": traffic,
         "bottlenecks": bottlenecks,
@@ -294,3 +309,49 @@ def build_operational_scene(
             "anpr": len(anpr),
         },
     }
+
+
+def filter_scene_at(scene: Mapping[str, Any], cutoff_s: float) -> dict[str, Any]:
+    """Return an operational scene containing observations up to ``cutoff_s``."""
+    if not math.isfinite(cutoff_s) or cutoff_s < 0:
+        raise ValueError("scene replay cutoff must be finite and non-negative")
+    route_timed = [
+        dict(item)
+        for item in scene.get("route_timed", [])
+        if _number(item.get("time_s")) <= cutoff_s
+    ]
+    filtered: dict[str, Any] = {
+        "route_timed": route_timed,
+        "route": [item["position"] for item in route_timed],
+    }
+    for layer in ("hazards", "traffic", "bottlenecks", "anpr"):
+        filtered[layer] = [
+            dict(item)
+            for item in scene.get(layer, [])
+            if _number(item.get("time_s")) <= cutoff_s
+        ]
+    filtered["timeline"] = [
+        dict(item)
+        for item in scene.get("timeline", [])
+        if _number(item.get("time_s")) <= cutoff_s
+    ]
+    coordinates = [
+        *[(position[1], position[0]) for position in filtered["route"]],
+        *[
+            (point["position"][1], point["position"][0])
+            for point in [
+                *filtered["hazards"],
+                *filtered["traffic"],
+                *filtered["bottlenecks"],
+                *filtered["anpr"],
+            ]
+        ],
+    ]
+    filtered["center"] = _scene_center(coordinates)
+    filtered["counts"] = {
+        "hazards": len(filtered["hazards"]),
+        "traffic_windows": len(filtered["traffic"]),
+        "bottlenecks": len(filtered["bottlenecks"]),
+        "anpr": len(filtered["anpr"]),
+    }
+    return filtered

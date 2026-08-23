@@ -1,6 +1,6 @@
 import pytest
 
-from orchestrator import merge_or_add_event, run_pipeline
+from orchestrator import merge_or_add_event, road_detection_geometry_is_plausible, run_pipeline
 
 
 def event(event_id: str, lat: float, lon: float) -> dict:
@@ -38,3 +38,21 @@ def test_road_pipeline_validates_settings_before_loading_runtime() -> None:
             model_path="model.pt",
             frame_skip=0,
         )
+
+
+def test_road_geometry_gate_rejects_sky_and_degenerate_proposals() -> None:
+    assert road_detection_geometry_is_plausible(
+        (300, 400, 520, 650),
+        frame_width=1280,
+        frame_height=720,
+    )
+    assert not road_detection_geometry_is_plausible(
+        (300, 20, 520, 120),
+        frame_width=1280,
+        frame_height=720,
+    )
+    assert not road_detection_geometry_is_plausible(
+        (300, 400, 300, 650),
+        frame_width=1280,
+        frame_height=720,
+    )

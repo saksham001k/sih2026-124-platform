@@ -14,7 +14,7 @@ weather, camera, or Raspberry Pi.
 | Vulnerable pedestrian situations | Reuses person/vehicle tracks + crossing ROI + school geofence | No additional resident model | Does not infer a person’s age or “school child” identity |
 | Rash driving | Track-motion candidate rules | No additional resident model | No legal speed or intent claim |
 | Suspected hit-and-run | Proximity/departure candidate + masked ANPR correlation | Event/review pipeline | Investigative candidate; authority review required |
-| ANPR | FastALPR multi-frame consensus and evidence | Event-triggered/offline stage | Plate masked in dashboard; full text remains local |
+| ANPR | FastALPR geometry gate, track consensus, detector/OCR/vote thresholds and evidence | Event-triggered/offline stage | Raw proposals are not plates; confirmed text is masked and human-reviewed |
 | Live dashcam and GPS | Newest-frame edge agent + serial NMEA | Three resident models maximum | Capture FPS is separate from analytics FPS |
 | Low-bandwidth transfer | Atomic outbox + authenticated retries + idempotent server | Metadata/evidence packets | Full video remains local unless policy requests a clip |
 | Fleet GIS and deficiencies | SQLite ingestion, cross-bus clusters, GeoJSON export | Central lightweight service | Spatial cluster is not automatic municipal verification |

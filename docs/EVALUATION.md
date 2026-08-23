@@ -38,8 +38,22 @@ Also measure additional confirmation latency introduced by the filter.
 
 - Exact plate-match rate
 - Character accuracy
+- No-plate negative-clip false confirmation rate (target: zero verified tracks)
+- Plate-like proposals versus geometry/confidence rejects versus verified tracks
+- Exact winning-vote ratio and mean detector/OCR confidence for each confirmed track
 - Day/night, motion-blur and viewing-angle slices
 - Percentage marked for human review
+
+Do not report FastALPR region proposals as detected number plates. Only multi-frame tracks that
+pass every configured quality gate enter the review queue.
+
+## Human review and active learning
+
+- Review acceptance rate by class and mission
+- False-positive categories such as zebra paint, shadows, patches and signboards
+- Export rejected detections as hard negatives; preserve original inference artifacts
+- Re-run a frozen negative-clip regression set after every threshold or model change
+- Never tune only against the judge-demo clip; keep a separate validation set
 
 ## Urban assets and missing infrastructure
 
