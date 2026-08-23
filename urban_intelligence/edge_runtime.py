@@ -402,6 +402,41 @@ def _memory_info(path: Path) -> tuple[float | None, float | None]:
     return values.get("MemTotal"), values.get("MemAvailable")
 
 
+def detect_execution_environment(
+    *,
+    device_model: str | None,
+    machine: str,
+    container_marker_paths: Sequence[Path] = (
+        Path("/.dockerenv"),
+        Path("/run/.containerenv"),
+    ),
+    dmi_product_path: Path = Path("/sys/class/dmi/id/product_name"),
+    hypervisor_path: Path = Path("/sys/hypervisor/type"),
+) -> str:
+    """Conservatively distinguish physical Pi evidence from emulated runs.
+
+    This is a claim-provenance guard, not a security boundary. A virtual harness may
+    exercise every application adapter, but it must never satisfy the physical-device
+    field gate merely by supplying a Raspberry Pi-looking model string.
+    """
+    normalized_machine = machine.strip().lower()
+    if any(path.exists() for path in container_marker_paths):
+        return "container"
+    if device_model and "raspberry pi" in device_model.lower():
+        if normalized_machine.startswith(("arm", "aarch64")):
+            return "physical_device"
+        return "emulated"
+    virtualization = " ".join(
+        value
+        for value in (_read_text(dmi_product_path), _read_text(hypervisor_path))
+        if value
+    ).lower()
+    virtual_markers = ("kvm", "qemu", "virtualbox", "vmware", "hyper-v", "xen")
+    if any(marker in virtualization for marker in virtual_markers):
+        return "virtual_machine"
+    return "unknown"
+
+
 def sample_device_health(
     *,
     device_tree_path: Path = Path("/proc/device-tree/model"),
@@ -422,12 +457,17 @@ def sample_device_health(
         load_1m = float(os.getloadavg()[0])
     except (AttributeError, OSError):
         load_1m = None
+    machine = platform.machine() or "unknown"
     return {
         "sampled_at": datetime.now(UTC).isoformat(),
         "device_model": device_model,
         "raspberry_pi": bool(device_model and "raspberry pi" in device_model.lower()),
+        "execution_environment": detect_execution_environment(
+            device_model=device_model,
+            machine=machine,
+        ),
         "platform": platform.system() or "unknown",
-        "machine": platform.machine() or "unknown",
+        "machine": machine,
         "logical_cpu_count": os.cpu_count(),
         "load_1m": None if load_1m is None else round(load_1m, 3),
         "cpu_temperature_c": None if temperature_c is None else round(temperature_c, 2),

@@ -31,6 +31,12 @@ def evaluate_field_run(
     compute = metrics.get("compute_budget", {})
     gps = metrics.get("gps") or {}
     raspberry_pi = bool(device.get("raspberry_pi", device_status.get("raspberry_pi", False)))
+    execution_environment = str(
+        device.get(
+            "execution_environment",
+            device_status.get("execution_environment", "unknown"),
+        )
+    )
     runtime_s = float(metrics.get("runtime_seconds", 0) or 0)
     captured_frames = int(capture.get("captured_frames", 0) or 0)
     analytics_attempts = int(metrics.get("analytics_attempts", 0) or 0)
@@ -50,6 +56,15 @@ def evaluate_field_run(
                 "Raspberry Pi hardware detected"
                 if raspberry_pi
                 else "Run was not made on Raspberry Pi"
+            ),
+        ),
+        ValidationCheck(
+            "physical_execution_environment",
+            execution_environment == "physical_device",
+            (
+                "Execution environment is a physical device"
+                if execution_environment == "physical_device"
+                else f"Execution environment is {execution_environment}; physical device required"
             ),
         ),
         ValidationCheck(

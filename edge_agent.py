@@ -413,6 +413,7 @@ def run_agent(
     cv2_module: Any | None = None,
     runner_factory: Callable[[RunnerSpec, str], Any] | None = None,
     health_sampler: Callable[[], dict[str, Any]] = sample_device_health,
+    nmea_factory: Callable[..., SerialNMEAGPS] = SerialNMEAGPS,
 ) -> dict[str, Any]:
     if cv2_module is None:
         try:
@@ -445,7 +446,7 @@ def run_agent(
         gps_track = load_gps_csv(args.gps_csv) if args.gps_csv else None
         fixed_gps = parse_fixed_gps(args.fixed_gps) if args.fixed_gps else None
         if getattr(args, "gps_nmea_device", None):
-            nmea_gps = SerialNMEAGPS(
+            nmea_gps = nmea_factory(
                 args.gps_nmea_device,
                 baudrate=getattr(args, "gps_baud", 9600),
             )

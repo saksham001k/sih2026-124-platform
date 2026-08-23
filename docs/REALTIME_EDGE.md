@@ -77,7 +77,28 @@ Fixed coordinate for an explicitly labelled table demo:
 ```
 
 The fixed mode must never be described as real bus telemetry. Serial/NMEA ingestion is the
-next provider adapter; GPS interpolation and provenance fields already use the shared core.
+live provider adapter; GPS interpolation and provenance fields use the shared core.
+
+## Virtual Pi test boundary
+
+`virtual_pi_test.py` provides a deterministic pre-hardware integration mission. It injects
+synthetic camera frames, Pi-like resource telemetry, deterministic model latencies and valid
+NMEA RMC sentences while retaining the production scheduler, temporal filter, outbox,
+delivery client, fleet store and field validator.
+
+The resulting report separates what it proves from what it cannot prove:
+
+| Verified by the virtual mission | Still requires physical hardware |
+|---|---|
+| Capture/inference concurrency and load shedding | ARM runtime compatibility and speed |
+| Mixed-rate scheduler and compute-budget math | USB/UVC camera compatibility |
+| Serial NMEA parsing and GPS provenance | UART/USB electrical stability and antenna fix |
+| Temporal evidence, outbox and retry delivery | Sustained temperature, throttling and power |
+| Authenticated idempotent fleet ingestion | Road vibration, lighting and field accuracy |
+
+The field validator requires both Raspberry Pi detection and
+`execution_environment: physical_device`. Container, VM and emulated results can therefore
+never be promoted into a physical field claim by changing only the model name.
 
 ## Geofences
 

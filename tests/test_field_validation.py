@@ -8,7 +8,11 @@ def valid_metrics() -> dict:
         "runtime_seconds": 120,
         "capture": {"captured_frames": 1800},
         "analytics_attempts": 500,
-        "device": {"raspberry_pi": True, "device_model": "Raspberry Pi 5"},
+        "device": {
+            "raspberry_pi": True,
+            "device_model": "Raspberry Pi 5",
+            "execution_environment": "physical_device",
+        },
         "gps_source_type": "real_telemetry",
         "gps_provider": "serial_nmea",
         "gps": {"has_fix": True},
@@ -44,8 +48,21 @@ def test_any_failed_claim_gate_blocks_field_verification(key: str, value: object
 
 def test_non_pi_and_overloaded_run_cannot_be_mislabelled() -> None:
     metrics = valid_metrics()
-    metrics["device"] = {"raspberry_pi": False}
+    metrics["device"] = {
+        "raspberry_pi": False,
+        "execution_environment": "physical_device",
+    }
     metrics["compute_budget"] = {"overloaded": True, "estimated_utilization": 1.2}
     report = evaluate_field_run(metrics, {"mission_status": "completed"})
     failed = {item["key"] for item in report["checks"] if not item["passed"]}
     assert failed == {"physical_raspberry_pi", "compute_headroom"}
+
+
+@pytest.mark.parametrize("environment", ["emulated", "container", "virtual_machine", "unknown"])
+def test_non_physical_execution_environment_blocks_field_claim(environment: str) -> None:
+    metrics = valid_metrics()
+    metrics["device"]["execution_environment"] = environment
+    report = evaluate_field_run(metrics, {"mission_status": "completed"})
+    failed = {item["key"] for item in report["checks"] if not item["passed"]}
+    assert "physical_execution_environment" in failed
+    assert report["field_verified"] is False
