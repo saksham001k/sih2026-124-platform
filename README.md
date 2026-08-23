@@ -20,7 +20,7 @@ intelligence while transmitting evidence packets instead of continuous video.
 | Evidence packaging | CSV events, context image, crop and metrics JSON |
 | Command centre | Streamlit GIS map, filters, evidence review and system metrics |
 | Bandwidth proof | Measured full-video bytes versus generated evidence bytes |
-| ANPR | Dedicated plate-model pipeline with OCR voting and review threshold |
+| ANPR | FastALPR ONNX pipeline with multi-frame tracking, GPS evidence and masked console output |
 | Edge export | NCNN/ONNX export with measured size and inference latency |
 
 ## Architecture
@@ -155,19 +155,66 @@ python orchestrator.py \
 
 ## ANPR incident review
 
-ANPR requires a dedicated number-plate detector; generic YOLO vehicle boxes are not plate
-boxes. Install the optional OCR dependencies and run it on a selected incident clip:
+DrishtiPath integrates **MIT-licensed FastALPR** ONNX detection and OCR as the default ANPR
+runtime. The pipeline performs multi-frame plate tracking, exact OCR consensus, timestamp-based
+GPS attachment, and masked console output. Evidence files are written locally for authorized
+human review only.
+
+### Install
 
 ```bash
 pip install -r requirements-anpr.txt
-python anpr_pipeline.py \
-  --input incident_clip.mp4 \
-  --plate-model models/indian_plate_detector.pt
 ```
 
-The result includes multi-frame vote count, combined confidence, Indian-format
-plausibility and a `requires_human_review` flag. It is evidence assistance—not automatic
-law-enforcement attribution.
+This installs `fast-alpr[onnx]==0.4.0` with ONNX Runtime. Model weights download on first run
+and must not be committed to Git.
+
+### Run
+
+```bash
+python anpr_pipeline.py \
+  --input incident_clip.mp4 \
+  --gps gps_data.csv \
+  --gps-source-type synthetic_demo \
+  --confidence 0.20 \
+  --sample-fps 5 \
+  --output-dir artifacts/anpr
+```
+
+Use `--show-plate-text` only for local debugging. Default console output masks plate text.
+Set `--gps-source-type` explicitly to `synthetic_demo`, `real_telemetry`, or `unknown` —
+GPS provenance is never inferred from the filename.
+
+### Outputs
+
+The selected artifact directory receives:
+
+- `anpr_observations.csv` — every sampled plate observation with masked console-safe fields
+- `anpr_events.json` — multi-frame plate tracks that pass the automated quality gate
+- `anpr_result.json` — strongest confirmed event, or JSON `null` when none exist
+- `metrics.json` — model names, provider, GPS source type, sampled frames, detections and timing
+- `evidence/` — reviewable context frame and crop from the best observation per confirmed event
+
+Every emitted event sets `requires_human_review: true` and `status: "pending_review"`.
+`passes_automated_quality_gate` is `true` only when observation count, winning OCR votes,
+mean OCR confidence and Indian/Bharat format checks all pass. Invalid-format OCR never
+becomes a confirmed event (raw observations may still appear in the CSV).
+
+### Validation limitations
+
+- Functional smoke testing on a local clip is **not** an accuracy percentage.
+- FastALPR region/country prediction is ignored for acceptance because it can be unstable on
+  Indian footage.
+- Label GPS with `--gps-source-type`; the bundled `gps_data.csv` is synthetic demo data, not
+  real bus telemetry.
+- This pipeline never attributes enforcement automatically — human review is always required.
+
+### Privacy policy
+
+- Complete plate text may appear only in local evidence artifacts under operator control.
+- Console output masks plates by default.
+- Do not commit clips, ONNX weights, artifacts, or plate evidence to Git.
+- Do not transmit evidence automatically from this CLI.
 
 ## Edge model export
 
