@@ -274,24 +274,53 @@ labelled clearly when `gps_source_type` is `synthetic_demo`.
 - Real deployment needs camera calibration, real bus GPS and field validation.
 - Do not estimate vehicle speed in km/h from pixels without calibration and reliable GPS speed.
 
-## Edge model export
+## Edge model export and benchmarking
 
-For Raspberry Pi, NCNN is the primary target. Benchmark on the actual device before making
-performance claims:
+Export and benchmark Ultralytics models for ONNX or NCNN using reproducible warm-up, wall-time
+measurements, artifact hashes and prediction parity. See [edge deployment guide](docs/EDGE_DEPLOYMENT.md).
 
 ```bash
-python optimize_model.py --model yolov8n.pt --format ncnn --source bus.jpg
+python optimize_model.py \
+  --model models/road_hazards.pt \
+  --format onnx \
+  --precision fp32 \
+  --source clips/1.mp4 \
+  --device cpu \
+  --imgsz 640 \
+  --sampling uniform \
+  --warmup-runs 5 \
+  --benchmark-frames 50 \
+  --confidence 0.25 \
+  --iou 0.70 \
+  --report artifacts/edge_bench/road_hazards_onnx_fp32.json
 ```
 
-INT8 export requires representative calibration data:
+NCNN FP16:
 
 ```bash
 python optimize_model.py \
   --model models/road_hazards.pt \
   --format ncnn \
-  --int8 \
-  --data datasets/road_hazards.yaml
+  --precision fp16 \
+  --source clips/1.mp4 \
+  --device cpu \
+  --sampling uniform \
+  --report artifacts/edge_bench/road_hazards_ncnn_fp16.json
 ```
+
+INT8 ONNX export requires representative calibration YAML via `--data`. NCNN INT8 is rejected.
+Deprecated `--int8` maps to `--precision int8`.
+
+Reports include measured artifact sizes, SHA-256 hashes, inference and wall-time latency,
+`measured_end_to_end_fps` (samples / total wall time), prediction parity and optional validation
+metrics. Videos default to deterministic uniform sampling across the whole clip. Prediction
+parity is not validation accuracy; a single matched detection is weak evidence.
+
+`raspberry_pi_benchmarked` is detected automatically from Linux device-tree text when available
+and is never set by a CLI override. Mac/desktop runs remain `false`. Even on a Pi, results apply
+only to that machine (`hardware_scope: current_machine_only`).
+
+View reports in the dashboard **Edge benchmark** tab.
 
 ## Generated artifacts
 

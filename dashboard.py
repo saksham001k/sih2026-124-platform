@@ -356,6 +356,121 @@ def render_traffic_section(artifacts_dir: Path) -> None:
         st.json(summary)
 
 
+def render_edge_benchmark_section(report_path: Path) -> None:
+    report = load_json(str(report_path))
+    if not report:
+        st.info(
+            "No edge benchmark report found. Run:\n\n"
+            "```bash\n"
+            "python optimize_model.py \\\n"
+            "  --model models/road_hazards.pt \\\n"
+            "  --format onnx \\\n"
+            "  --precision fp32 \\\n"
+            "  --source clips/1.mp4 \\\n"
+            "  --device cpu \\\n"
+            "  --sampling uniform \\\n"
+            "  --warmup-runs 5 \\\n"
+            "  --benchmark-frames 50 \\\n"
+            "  --report artifacts/edge_bench/road_hazards_onnx_fp32.json\n"
+            "```"
+        )
+        return
+
+    if not report.get("raspberry_pi_benchmarked", False):
+        hardware_scope = report.get("runtime_provenance", {}).get(
+            "hardware_scope", "current_machine_only"
+        )
+        st.warning(
+            "This report was generated on the current machine only "
+            f"(`hardware_scope: {hardware_scope}`). "
+            "Do not present it as Raspberry Pi performance."
+        )
+
+    source = report.get("source_model", {})
+    exported = report.get("exported_model", {})
+    comparison = report.get("artifact_comparison", {})
+    source_bench = report.get("source_benchmark", {})
+    exported_bench = report.get("exported_benchmark", {})
+    parity = report.get("prediction_parity", {})
+    validation = report.get("validation", {"status": "not_run"})
+    config = report.get("benchmark_configuration", {})
+
+    change_label = comparison.get("change_label", "size_reduction")
+    change_percent = float(comparison.get("change_percent", 0))
+    size_metric_label = (
+        "Size increase" if change_label == "size_increase" else "Size reduction"
+    )
+
+    row_one = st.columns(3)
+    row_one[0].metric("Source size (MiB)", f"{float(source.get('mib', 0)):.2f}")
+    row_one[1].metric("Exported size (MiB)", f"{float(exported.get('mib', 0)):.2f}")
+    row_one[2].metric(size_metric_label, f"{change_percent:.1f}%")
+
+    row_two = st.columns(3)
+    row_two[0].metric(
+        "Source wall P95 (ms)", f"{float(source_bench.get('wall_p95_ms', 0)):.1f}"
+    )
+    row_two[1].metric(
+        "Exported wall P95 (ms)", f"{float(exported_bench.get('wall_p95_ms', 0)):.1f}"
+    )
+    row_two[2].metric(
+        "Exported measured FPS",
+        f"{float(exported_bench.get('measured_end_to_end_fps', 0)):.1f}",
+    )
+
+    st.caption(
+        "Measured FPS = timed samples / total wall time. "
+        f"Median-derived theoretical FPS (not measured throughput): "
+        f"{float(exported_bench.get('fps_from_median_wall_ms', 0)):.1f}."
+    )
+    st.caption(
+        f"Sampling: {config.get('sampling', 'unknown')} · "
+        f"unique frames: {config.get('unique_frames_loaded', 0)} / "
+        f"{config.get('source_total_frames', 0)}"
+    )
+
+    st.subheader("Prediction parity")
+    st.caption(
+        parity.get(
+            "note",
+            "Prediction parity is not validation accuracy. "
+            "A single matched detection is insufficient evidence.",
+        )
+    )
+    if int(parity.get("matched_detections", 0)) <= 1:
+        st.warning(
+            "Matched detections are too few for strong parity evidence. "
+            "This is not validation accuracy."
+        )
+    parity_cols = st.columns(4)
+    parity_cols[0].metric("Frames compared", int(parity.get("frames_compared", 0)))
+    parity_cols[1].metric("Matched detections", int(parity.get("matched_detections", 0)))
+    parity_cols[2].metric(
+        "Source match recall", f"{float(parity.get('source_match_recall', 0)):.2f}"
+    )
+    parity_cols[3].metric(
+        "Exported match precision",
+        f"{float(parity.get('exported_match_precision', 0)):.2f}",
+    )
+
+    st.subheader("Validation")
+    if validation.get("status") == "not_run":
+        st.info("Validation was not run for this report.")
+    else:
+        st.json(validation)
+
+    runtime = report.get("runtime_provenance", {})
+    st.caption(
+        f"Runtime: {runtime.get('operating_system', 'unknown')} · "
+        f"{runtime.get('machine_architecture', 'unknown')} · "
+        f"Ultralytics {runtime.get('ultralytics_version', 'unknown')} · "
+        f"device {runtime.get('requested_inference_device', 'unknown')}"
+    )
+
+    with st.expander("Edge benchmark report JSON"):
+        st.json(report)
+
+
 def main() -> None:
     st.title("DrishtiPath Urban Intelligence Command Centre")
     st.caption("Fleet-scale road and traffic evidence · Edge verified · Bandwidth aware")
@@ -366,6 +481,12 @@ def main() -> None:
         st.cache_data.clear()
         st.rerun()
 
+    edge_report_value = st.sidebar.text_input(
+        "Edge benchmark report",
+        "artifacts/edge_bench/road_hazards_onnx_fp32.json",
+    )
+    edge_report_path = Path(edge_report_value)
+
     events = load_csv(str(artifacts_dir / "events.csv"))
     detections = load_csv(str(artifacts_dir / "detections.csv"))
     metrics = load_json(str(artifacts_dir / "metrics.json"))
@@ -374,7 +495,9 @@ def main() -> None:
         artifacts_dir / "traffic_timeseries.csv"
     ).is_file()
 
-    road_tab, traffic_tab = st.tabs(["Road hazards", "Traffic analytics"])
+    road_tab, traffic_tab, edge_tab = st.tabs(
+        ["Road hazards", "Traffic analytics", "Edge benchmark"]
+    )
     with road_tab:
         render_road_hazard_section(
             artifacts_dir=artifacts_dir,
@@ -390,6 +513,8 @@ def main() -> None:
                 "`artifacts/traffic_input_video`."
             )
         render_traffic_section(artifacts_dir)
+    with edge_tab:
+        render_edge_benchmark_section(edge_report_path)
 
 
 if __name__ == "__main__":
