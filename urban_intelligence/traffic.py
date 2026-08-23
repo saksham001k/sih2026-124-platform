@@ -224,6 +224,7 @@ class TrafficWindow:
     latitude: float
     longitude: float
     congested: bool
+    is_partial: bool = False
 
 
 @dataclass(slots=True)
@@ -312,6 +313,7 @@ class TrafficWindowAggregator:
             latitude=float(location.latitude),
             longitude=float(location.longitude),
             congested=False,
+            is_partial=partial,
         )
         self.windows.append(window)
         self._window_index += 1
@@ -345,10 +347,12 @@ class CongestionDetector:
     min_mean_vehicles: float
     min_mean_occupancy: float
     consecutive_windows: int
-    _streak: list[TrafficWindow] = field(default_factory=list)
+    _pending_streak: list[TrafficWindow] = field(default_factory=list)
+    _episode_windows: list[TrafficWindow] = field(default_factory=list)
     _episode_active: bool = False
     _event_counter: int = 0
     events: list[BottleneckEvent] = field(default_factory=list)
+    congested_window_indices: set[int] = field(default_factory=set)
 
     def __post_init__(self) -> None:
         if self.min_mean_vehicles < 0:
@@ -360,60 +364,112 @@ class CongestionDetector:
 
     def qualifies(self, window: TrafficWindow) -> bool:
         return (
-            window.mean_vehicle_count >= self.min_mean_vehicles
+            not window.is_partial
+            and window.mean_vehicle_count >= self.min_mean_vehicles
             and window.mean_occupancy >= self.min_mean_occupancy
         )
 
     def observe(self, window: TrafficWindow) -> BottleneckEvent | None:
-        if self.qualifies(window):
-            self._streak.append(window)
-            if not self._episode_active and len(self._streak) >= self.consecutive_windows:
-                self._episode_active = True
-                self._event_counter += 1
-                qualifying = self._streak[-self.consecutive_windows :]
-                mean_vehicles = sum(item.mean_vehicle_count for item in qualifying) / len(
-                    qualifying
-                )
-                mean_occ = sum(item.mean_occupancy for item in qualifying) / len(qualifying)
-                trigger = qualifying[-1]
-                event = BottleneckEvent(
-                    event_id=f"bottleneck-{self._event_counter:04d}",
-                    start_time_s=qualifying[0].start_time_s,
-                    end_time_s=trigger.end_time_s,
-                    triggering_window_index=trigger.window_index,
-                    mean_vehicle_count=round(mean_vehicles, 4),
-                    mean_occupancy=round(mean_occ, 4),
-                    latitude=trigger.latitude,
-                    longitude=trigger.longitude,
-                    consecutive_windows=len(qualifying),
-                )
-                self.events.append(event)
-                return event
+        """Process one closed window. Partial windows never affect episodes."""
+        if window.is_partial:
             return None
 
-        self._streak = []
-        self._episode_active = False
+        if self.qualifies(window):
+            emitted: BottleneckEvent | None = None
+            if not self._episode_active:
+                self._pending_streak.append(window)
+                if len(self._pending_streak) >= self.consecutive_windows:
+                    self._episode_active = True
+                    self._episode_windows = list(self._pending_streak)
+                    self._pending_streak = []
+                    for item in self._episode_windows:
+                        self.congested_window_indices.add(item.window_index)
+                    emitted = self._emit_or_update_event(is_new=True)
+            else:
+                self._episode_windows.append(window)
+                self.congested_window_indices.add(window.window_index)
+                self._emit_or_update_event(is_new=False)
+            return emitted
+
+        self._pending_streak = []
+        if self._episode_active:
+            self._episode_active = False
+            self._episode_windows = []
         return None
+
+    def finalize(self) -> None:
+        """Close an active episode at EOF using the last qualifying full window."""
+        if self._episode_active and self._episode_windows:
+            self._emit_or_update_event(is_new=False)
+        self._episode_active = False
+        self._pending_streak = []
+        self._episode_windows = []
+
+    def _emit_or_update_event(self, *, is_new: bool) -> BottleneckEvent:
+        assert self._episode_windows
+        windows = self._episode_windows
+        mean_vehicles = sum(item.mean_vehicle_count for item in windows) / len(windows)
+        mean_occ = sum(item.mean_occupancy for item in windows) / len(windows)
+        latest = windows[-1]
+        if is_new:
+            self._event_counter += 1
+            trigger = windows[self.consecutive_windows - 1]
+            event = BottleneckEvent(
+                event_id=f"bottleneck-{self._event_counter:04d}",
+                start_time_s=windows[0].start_time_s,
+                end_time_s=latest.end_time_s,
+                triggering_window_index=trigger.window_index,
+                mean_vehicle_count=round(mean_vehicles, 4),
+                mean_occupancy=round(mean_occ, 4),
+                latitude=latest.latitude,
+                longitude=latest.longitude,
+                consecutive_windows=self.consecutive_windows,
+            )
+            self.events.append(event)
+            return event
+
+        previous = self.events[-1]
+        updated = BottleneckEvent(
+            event_id=previous.event_id,
+            start_time_s=windows[0].start_time_s,
+            end_time_s=latest.end_time_s,
+            triggering_window_index=previous.triggering_window_index,
+            mean_vehicle_count=round(mean_vehicles, 4),
+            mean_occupancy=round(mean_occ, 4),
+            latitude=latest.latitude,
+            longitude=latest.longitude,
+            consecutive_windows=previous.consecutive_windows,
+        )
+        self.events[-1] = updated
+        return updated
 
     @property
     def episode_active(self) -> bool:
         return self._episode_active
 
 
+def apply_congestion_flags(
+    windows: list[TrafficWindow],
+    congested_indices: set[int],
+) -> list[TrafficWindow]:
+    """Mark windows that belonged to a confirmed congestion episode."""
+    return [
+        replace(window, congested=window.window_index in congested_indices)
+        for window in windows
+    ]
+
+
 def mark_windows_congested(
     windows: list[TrafficWindow],
     events: list[BottleneckEvent],
 ) -> list[TrafficWindow]:
-    """Return windows with congested=True for indices covered by bottleneck episodes."""
+    """Backward-compatible helper for event-index marking (prefer apply_congestion_flags)."""
     congested_indexes: set[int] = set()
     for event in events:
         start_index = max(0, event.triggering_window_index - event.consecutive_windows + 1)
         for index in range(start_index, event.triggering_window_index + 1):
             congested_indexes.add(index)
-    return [
-        replace(window, congested=True) if window.window_index in congested_indexes else window
-        for window in windows
-    ]
+    return apply_congestion_flags(windows, congested_indexes)
 
 
 def validate_traffic_settings(

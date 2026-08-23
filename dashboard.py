@@ -289,20 +289,26 @@ def render_traffic_section(artifacts_dir: Path) -> None:
         )
 
     totals = summary.get("totals_by_class", {})
-    metric_columns = st.columns(5)
-    metric_columns[0].metric(
+    row_one = st.columns(3)
+    row_one[0].metric(
         "Unique tracked vehicles", int(summary.get("total_unique_tracked_vehicles", 0))
     )
-    metric_columns[1].metric(
+    row_one[1].metric(
+        "Current ROI vehicles", int(summary.get("current_vehicle_count", 0))
+    )
+    row_one[2].metric(
         "Peak ROI vehicles", int(summary.get("max_vehicle_count", 0))
     )
-    metric_columns[2].metric(
-        "Mean ROI vehicles", f"{float(summary.get('average_vehicle_count', 0)):.2f}"
+    row_two = st.columns(3)
+    row_two[0].metric(
+        "Mean occupancy",
+        f"{float(summary.get('average_occupancy', 0)) * 100:.1f}%",
+        help="Image-space proxy across processed frames",
     )
-    metric_columns[3].metric(
+    row_two[1].metric(
         "Peak occupancy", f"{float(summary.get('max_occupancy', 0)) * 100:.1f}%"
     )
-    metric_columns[4].metric(
+    row_two[2].metric(
         "Bottleneck events", int(summary.get("bottleneck_event_count", len(bottlenecks)))
     )
 

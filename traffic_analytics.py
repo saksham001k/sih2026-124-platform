@@ -22,7 +22,7 @@ from urban_intelligence.traffic import (
     TrafficDetection,
     TrafficWindowAggregator,
     UniqueVehicleCounter,
-    mark_windows_congested,
+    apply_congestion_flags,
     parse_roi,
     summarize_frame,
     validate_traffic_settings,
@@ -123,6 +123,9 @@ def run_pipeline(
         max(1.0, source_fps / frame_skip),
         (frame_width, frame_height),
     )
+    if not writer.isOpened():
+        capture.release()
+        raise SystemExit(f"Unable to open annotated video writer: {annotated_path}")
 
     unique_counter = UniqueVehicleCounter()
     window_agg = TrafficWindowAggregator(window_seconds=window_seconds)
@@ -139,6 +142,8 @@ def run_pipeline(
     processed_frames = 0
     source_frames = 0
     frame_index = 0
+    current_vehicle_count = 0
+    current_occupancy = 0.0
     start = time.perf_counter()
 
     rx1, ry1, rx2, ry2 = roi.pixel_bounds(frame_width, frame_height)
@@ -211,6 +216,8 @@ def run_pipeline(
             newly_counted = unique_counter.observe(snapshot.roi_detections)
             vehicle_counts_seen.append(snapshot.vehicle_count)
             occupancy_seen.append(snapshot.occupancy)
+            current_vehicle_count = snapshot.vehicle_count
+            current_occupancy = snapshot.occupancy
 
             for detection in snapshot.roi_detections:
                 location = gps_track.at(detection.video_time_s)
@@ -300,8 +307,12 @@ def run_pipeline(
     closed = window_agg.flush(gps_track.at)
     for window in closed:
         congestion.observe(window)
+    congestion.finalize()
 
-    windows = mark_windows_congested(window_agg.windows, congestion.events)
+    windows = apply_congestion_flags(
+        window_agg.windows,
+        congestion.congested_window_indices,
+    )
     elapsed_s = time.perf_counter() - start
     processing_fps = processed_frames / elapsed_s if elapsed_s else 0.0
 
@@ -322,6 +333,7 @@ def run_pipeline(
             "latitude": round(window.latitude, 7),
             "longitude": round(window.longitude, 7),
             "congested": window.congested,
+            "is_partial": window.is_partial,
         }
         for class_name in sorted(VEHICLE_CLASSES):
             row[f"count_{class_name}"] = window.class_counts.get(class_name, 0)
@@ -366,12 +378,14 @@ def run_pipeline(
             for name in sorted(VEHICLE_CLASSES)
         },
         "max_vehicle_count": max(vehicle_counts_seen) if vehicle_counts_seen else 0,
+        "current_vehicle_count": current_vehicle_count,
         "average_vehicle_count": (
             round(sum(vehicle_counts_seen) / len(vehicle_counts_seen), 4)
             if vehicle_counts_seen
             else 0.0
         ),
         "max_occupancy": round(max(occupancy_seen), 4) if occupancy_seen else 0.0,
+        "current_occupancy": round(current_occupancy, 4),
         "average_occupancy": (
             round(sum(occupancy_seen) / len(occupancy_seen), 4) if occupancy_seen else 0.0
         ),
@@ -398,6 +412,7 @@ def run_pipeline(
         "latitude",
         "longitude",
         "congested",
+        "is_partial",
     ]
     write_csv(output_dir / "traffic_timeseries.csv", timeseries_rows, timeseries_columns)
     write_csv(
