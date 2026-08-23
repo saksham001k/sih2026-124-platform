@@ -14,6 +14,7 @@ from edge_agent import (
     prepare_output_dir,
     run_agent,
     validate_gps_configuration,
+    validate_mission_identifiers,
 )
 
 
@@ -114,6 +115,35 @@ def test_fixed_demo_coordinate_cannot_be_labelled_real_telemetry() -> None:
         fixed_gps="28.6,77.2",
         gps_source_type="synthetic_demo",
     )
+
+
+def test_live_nmea_requires_real_telemetry_and_is_mutually_exclusive() -> None:
+    validate_gps_configuration(
+        gps_csv=None,
+        fixed_gps=None,
+        gps_nmea_device="/dev/ttyUSB0",
+        gps_source_type="real_telemetry",
+    )
+    with pytest.raises(ValueError, match="must be labelled"):
+        validate_gps_configuration(
+            gps_csv=None,
+            fixed_gps=None,
+            gps_nmea_device="/dev/ttyUSB0",
+            gps_source_type="synthetic_demo",
+        )
+
+
+def test_mission_identifiers_are_safe_for_outbox_and_fleet_storage() -> None:
+    validate_mission_identifiers("bus-42", "mission-2026-08-23", "route.blue")
+    with pytest.raises(ValueError, match="vehicle_id"):
+        validate_mission_identifiers("../../bus", "mission-1", "route-1")
+    with pytest.raises(ValueError, match="only one"):
+        validate_gps_configuration(
+            gps_csv="route.csv",
+            fixed_gps=None,
+            gps_nmea_device="/dev/ttyUSB0",
+            gps_source_type="real_telemetry",
+        )
 
 
 def test_live_agent_loop_writes_truthful_metrics_with_injected_runtimes(tmp_path: Path) -> None:

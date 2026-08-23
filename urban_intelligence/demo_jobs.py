@@ -16,7 +16,7 @@ from typing import Any
 from urban_intelligence.gps import load_gps_csv
 
 VIDEO_EXTENSIONS = {".mp4", ".mov", ".avi", ".mkv"}
-SUPPORTED_MODULES = ("road", "traffic", "anpr")
+SUPPORTED_MODULES = ("road", "traffic", "assets", "anpr")
 SCAN_PROFILES: dict[str, tuple[str, ...]] = {
     "quick": ("road", "traffic"),
     "full": SUPPORTED_MODULES,
@@ -53,6 +53,9 @@ class AnalysisRequest:
     scan_profile: str
     road_model: str = "models/road_hazards.pt"
     traffic_model: str = "yolov8n.pt"
+    asset_model: str = "models/urban_assets.pt"
+    asset_inventory_path: Path | None = None
+    school_zones_path: Path | None = None
 
 
 def modules_for_profile(profile: str, custom_modules: tuple[str, ...] = ()) -> tuple[str, ...]:
@@ -184,6 +187,11 @@ def prepare_run(
     synthetic_gps_path: Path = Path("gps_data.csv"),
     road_model: str = "models/road_hazards.pt",
     traffic_model: str = "yolov8n.pt",
+    asset_model: str = "models/urban_assets.pt",
+    asset_inventory_payload: bytes | bytearray | memoryview | None = None,
+    original_asset_inventory_name: str = "assets.json",
+    school_zones_payload: bytes | bytearray | memoryview | None = None,
+    original_school_zones_name: str = "school_zones.json",
     run_id: str | None = None,
     video_probe: Callable[[Path], VideoMetadata] = probe_video,
 ) -> AnalysisRequest:
@@ -242,6 +250,28 @@ def prepare_run(
                 "telemetry point for the remaining frames."
             )
 
+        asset_inventory_path: Path | None = None
+        if asset_inventory_payload is not None:
+            validate_upload(
+                original_asset_inventory_name,
+                asset_inventory_payload,
+                allowed_extensions={".json"},
+                max_bytes=5 * 1024 * 1024,
+            )
+            asset_inventory_path = input_dir / "assets.json"
+            asset_inventory_path.write_bytes(asset_inventory_payload)
+
+        school_zones_path: Path | None = None
+        if school_zones_payload is not None:
+            validate_upload(
+                original_school_zones_name,
+                school_zones_payload,
+                allowed_extensions={".json"},
+                max_bytes=5 * 1024 * 1024,
+            )
+            school_zones_path = input_dir / "school_zones.json"
+            school_zones_path.write_bytes(school_zones_payload)
+
         request = AnalysisRequest(
             run_id=selected_run_id,
             run_dir=run_dir,
@@ -252,6 +282,9 @@ def prepare_run(
             scan_profile=scan_profile,
             road_model=road_model,
             traffic_model=traffic_model,
+            asset_model=asset_model,
+            asset_inventory_path=asset_inventory_path,
+            school_zones_path=school_zones_path,
         )
         manifest = {
             "schema_version": 1,
@@ -281,6 +314,24 @@ def prepare_run(
                     "end_time_s": gps_end_s,
                     "covers_video": not warnings,
                 },
+                "asset_inventory": (
+                    None
+                    if asset_inventory_path is None
+                    else {
+                        "original_name": Path(original_asset_inventory_name).name,
+                        "stored_path": str(asset_inventory_path.relative_to(run_dir)),
+                        "bytes": len(asset_inventory_payload or b""),
+                    }
+                ),
+                "school_zones": (
+                    None
+                    if school_zones_path is None
+                    else {
+                        "original_name": Path(original_school_zones_name).name,
+                        "stored_path": str(school_zones_path.relative_to(run_dir)),
+                        "bytes": len(school_zones_payload or b""),
+                    }
+                ),
             },
             "stages": {
                 module: {"status": "queued", "message": "Waiting to run"}
@@ -301,6 +352,7 @@ def preflight_checks(
     *,
     road_model: str,
     traffic_model: str = "yolov8n.pt",
+    asset_model: str = "models/urban_assets.pt",
 ) -> dict[str, tuple[bool, str]]:
     checks: dict[str, tuple[bool, str]] = {}
     if "road" in modules:
@@ -347,6 +399,22 @@ def preflight_checks(
                 else "Install requirements-anpr.txt"
             ),
         )
+    if "assets" in modules:
+        runtime_available = importlib.util.find_spec("ultralytics") is not None
+        model_available = Path(asset_model).is_file()
+        available = runtime_available and model_available
+        checks["Urban-assets model"] = (
+            available,
+            (
+                asset_model
+                if available
+                else (
+                    f"Missing: {asset_model}"
+                    if not model_available
+                    else "Install requirements.txt"
+                )
+            ),
+        )
     return checks
 
 
@@ -368,7 +436,7 @@ def _road_runner(request: AnalysisRequest) -> Mapping[str, Any]:
 
 
 def _traffic_runner(request: AnalysisRequest) -> Mapping[str, Any]:
-    from traffic_analytics import run_pipeline
+    from traffic_analytics import load_school_zones, run_pipeline
     from urban_intelligence.traffic import parse_roi
 
     return run_pipeline(
@@ -385,6 +453,7 @@ def _traffic_runner(request: AnalysisRequest) -> Mapping[str, Any]:
         congestion_consecutive_windows=3,
         gps_source_type=request.gps_source_type,
         gps_label=str(request.gps_path),
+        school_zones=load_school_zones(request.school_zones_path),
     )
 
 
@@ -397,7 +466,6 @@ def _anpr_runner(request: AnalysisRequest) -> Mapping[str, Any]:
         create_alpr_engine,
         run_pipeline,
     )
-
     detector_confidence = 0.20
     predict_fn = create_alpr_engine(
         detector_model=DEFAULT_DETECTOR_MODEL,
@@ -427,11 +495,57 @@ def _anpr_runner(request: AnalysisRequest) -> Mapping[str, Any]:
     )
 
 
+def _assets_runner(request: AnalysisRequest) -> Mapping[str, Any]:
+    from asset_inspection import run_pipeline
+
+    return run_pipeline(
+        input_path=request.input_path,
+        gps_path=request.gps_path,
+        output_dir=request.run_dir / "assets",
+        model_path=request.asset_model,
+        inventory_path=request.asset_inventory_path,
+        confidence=0.25,
+        frame_skip=3,
+        window_size=5,
+        min_hits=3,
+        gps_source_type=request.gps_source_type,
+    )
+
+
 DEFAULT_STAGE_RUNNERS: dict[str, StageRunner] = {
     "road": _road_runner,
     "traffic": _traffic_runner,
+    "assets": _assets_runner,
     "anpr": _anpr_runner,
 }
+
+
+def correlate_incidents(run_dir: Path) -> dict[str, Any]:
+    """Link traffic safety candidates to masked ANPR evidence after both stages finish."""
+    from urban_intelligence.incidents import link_anpr_evidence
+
+    safety_path = run_dir / "traffic" / "safety_events.json"
+    anpr_path = run_dir / "anpr" / "anpr_events.json"
+    if not safety_path.is_file() or not anpr_path.is_file():
+        return {"status": "not_run", "reason": "traffic and ANPR outputs are both required"}
+    safety = json.loads(safety_path.read_text(encoding="utf-8"))
+    anpr = json.loads(anpr_path.read_text(encoding="utf-8"))
+    if not isinstance(safety, list) or not isinstance(anpr, list):
+        raise ValueError("safety and ANPR event files must contain lists")
+    incidents = link_anpr_evidence(safety, anpr)
+    output_dir = run_dir / "incidents"
+    output_dir.mkdir(exist_ok=True)
+    output_path = output_dir / "incidents.json"
+    output_path.write_text(json.dumps(incidents, indent=2), encoding="utf-8")
+    return {
+        "status": "completed",
+        "event_count": len(incidents),
+        "anpr_candidates_linked": sum(
+            item.get("anpr_link_status") == "candidate_pending_review"
+            for item in incidents
+        ),
+        "directory": "incidents",
+    }
 
 
 def run_analysis(
@@ -483,9 +597,25 @@ def run_analysis(
         if progress:
             progress(module, stage["status"], stage["message"], index, total)
 
-    manifest["status"] = "completed_with_errors" if failures else "completed"
+    stage_failures = failures
+    auxiliary_failures = 0
+    try:
+        correlation = correlate_incidents(request.run_dir)
+    except (OSError, ValueError, json.JSONDecodeError) as exc:
+        auxiliary_failures = 1
+        correlation = {
+            "status": "failed",
+            "message": str(exc) or type(exc).__name__,
+            "error_type": type(exc).__name__,
+        }
+    manifest["outputs"]["incident_correlation"] = correlation
+
+    manifest["status"] = (
+        "completed_with_errors" if stage_failures or auxiliary_failures else "completed"
+    )
     manifest["finished_at"] = datetime.now(UTC).isoformat()
-    manifest["successful_stages"] = total - failures
-    manifest["failed_stages"] = failures
+    manifest["successful_stages"] = total - stage_failures
+    manifest["failed_stages"] = stage_failures
+    manifest["auxiliary_failures"] = auxiliary_failures
     _write_manifest(request.run_dir, manifest)
     return manifest

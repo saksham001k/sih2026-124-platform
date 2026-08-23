@@ -1,0 +1,11 @@
+path: /absolute/path/to/urban_assets_yolo
+train: images/train
+val: images/val
+names:
+  0: road_divider
+  1: zebra_crossing
+  2: traffic_signboard
+  3: damaged_divider
+  4: damaged_zebra_crossing
+  5: damaged_traffic_signboard
+  6: waterlogging

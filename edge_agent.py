@@ -14,6 +14,7 @@ from typing import Any
 
 from urban_intelligence.classes import normalize_class_name
 from urban_intelligence.edge_runtime import (
+    SAFE_EVENT_ID,
     EvidenceOutbox,
     FrameEnvelope,
     GeoFence,
@@ -29,6 +30,7 @@ from urban_intelligence.edge_runtime import (
 )
 from urban_intelligence.gps import GPSPoint, GPSTrack, load_gps_csv
 from urban_intelligence.models import Detection
+from urban_intelligence.nmea import SerialNMEAGPS
 from urban_intelligence.temporal import TemporalEventFilter
 from urban_intelligence.traffic import PERSON_CLASS, VEHICLE_CLASSES
 
@@ -254,13 +256,27 @@ def validate_gps_configuration(
     gps_csv: str | None,
     fixed_gps: str | None,
     gps_source_type: str,
+    gps_nmea_device: str | None = None,
 ) -> None:
-    if gps_csv and fixed_gps:
-        raise ValueError("use only one of --gps-csv or --fixed-gps")
-    if not gps_csv and not fixed_gps:
-        raise ValueError("provide --gps-csv or --fixed-gps")
+    configured = [bool(gps_csv), bool(fixed_gps), bool(gps_nmea_device)]
+    if sum(configured) > 1:
+        raise ValueError("use only one of --gps-csv, --fixed-gps, or --gps-nmea-device")
+    if not any(configured):
+        raise ValueError("provide --gps-csv, --fixed-gps, or --gps-nmea-device")
     if fixed_gps and gps_source_type == "real_telemetry":
         raise ValueError("a fixed demo coordinate cannot be labelled real_telemetry")
+    if gps_nmea_device and gps_source_type != "real_telemetry":
+        raise ValueError("a live NMEA device must be labelled real_telemetry")
+
+
+def validate_mission_identifiers(vehicle_id: str, mission_id: str, route_id: str) -> None:
+    for name, value in (
+        ("vehicle_id", vehicle_id),
+        ("mission_id", mission_id),
+        ("route_id", route_id),
+    ):
+        if not SAFE_EVENT_ID.fullmatch(value):
+            raise ValueError(f"{name} must be a safe non-empty identifier")
 
 
 def _gps_at(
@@ -268,11 +284,18 @@ def _gps_at(
     elapsed_s: float,
     gps_track: GPSTrack | None,
     fixed_gps: GPSPoint | None,
+    nmea_gps: SerialNMEAGPS | None = None,
+    nmea_max_age_s: float = 3.0,
 ) -> GPSPoint:
     if gps_track is not None:
         return gps_track.at(elapsed_s)
     if fixed_gps is not None:
         return GPSPoint(elapsed_s, fixed_gps.latitude, fixed_gps.longitude)
+    if nmea_gps is not None:
+        fix = nmea_gps.latest(max_age_s=nmea_max_age_s)
+        if fix is None:
+            raise RuntimeError("Live NMEA GPS fix is unavailable or stale")
+        return GPSPoint(elapsed_s, fix.point.latitude, fix.point.longitude)
     raise RuntimeError("GPS provider is not configured")
 
 
@@ -306,13 +329,24 @@ def _save_confirmation(
     output_dir: Path,
     outbox: EvidenceOutbox,
     gps_source_type: str,
+    vehicle_id: str,
+    mission_id: str,
+    route_id: str,
 ) -> dict[str, Any]:
-    event_id = f"{task_name}-{frame.frame_index:08d}-{confirmation.hit_count}h"
+    detection = confirmation.detection
+    class_key = "".join(
+        character if character.isalnum() else "-"
+        for character in confirmation.class_name
+    ).strip("-")
+    track_key = "untracked" if detection.track_id is None else str(detection.track_id)
+    event_id = (
+        f"{task_name}-{frame.frame_index:08d}-{class_key[:32]}-{track_key}-"
+        f"{confirmation.hit_count}h"
+    )
     evidence_dir = output_dir / "evidence"
     evidence_dir.mkdir(exist_ok=True)
     context_path = evidence_dir / f"{event_id}-frame.jpg"
     crop_path = evidence_dir / f"{event_id}-crop.jpg"
-    detection = confirmation.detection
     x1, y1, x2, y2 = detection.bbox
     height, width = frame.payload.shape[:2]
     crop = frame.payload[max(0, y1) : min(height, y2), max(0, x1) : min(width, x2)]
@@ -330,6 +364,9 @@ def _save_confirmation(
         "lon": round(detection.longitude, 7),
         "temporal_hits": confirmation.hit_count,
         "gps_source_type": gps_source_type,
+        "vehicle_id": vehicle_id,
+        "mission_id": mission_id,
+        "route_id": route_id,
         "status": "pending_review",
         "requires_human_review": True,
         "evidence_frame": str(context_path) if context_written else "",
@@ -392,15 +429,30 @@ def run_agent(
         gps_csv=args.gps_csv,
         fixed_gps=args.fixed_gps,
         gps_source_type=args.gps_source_type,
+        gps_nmea_device=getattr(args, "gps_nmea_device", None),
     )
+    vehicle_id = getattr(args, "vehicle_id", "bus-demo-01")
+    mission_id = getattr(args, "mission_id", "mission-demo")
+    route_id = getattr(args, "route_id", "route-unassigned")
+    validate_mission_identifiers(vehicle_id, mission_id, route_id)
     capture = cv2.VideoCapture(source)
     if not capture.isOpened():
         raise RuntimeError(f"could not open dashcam source: {args.source}")
     source_fps = float(capture.get(cv2.CAP_PROP_FPS) or 30.0)
 
+    nmea_gps: SerialNMEAGPS | None = None
     try:
         gps_track = load_gps_csv(args.gps_csv) if args.gps_csv else None
         fixed_gps = parse_fixed_gps(args.fixed_gps) if args.fixed_gps else None
+        if getattr(args, "gps_nmea_device", None):
+            nmea_gps = SerialNMEAGPS(
+                args.gps_nmea_device,
+                baudrate=getattr(args, "gps_baud", 9600),
+            )
+            nmea_gps.start()
+            nmea_gps.wait_for_fix(
+                timeout_s=getattr(args, "gps_fix_timeout_s", 15.0)
+            )
         geofences = load_geofences(Path(args.geofences) if args.geofences else None)
 
         specs = build_runner_specs(args)
@@ -410,6 +462,8 @@ def run_agent(
         }
     except BaseException:
         capture.release()
+        if nmea_gps is not None:
+            nmea_gps.close()
         raise
     schedules = model_schedules(args.profile, set(runners))
     scheduler = InferenceScheduler(schedules)
@@ -454,6 +508,8 @@ def run_agent(
                     elapsed_s=elapsed_s,
                     gps_track=gps_track,
                     fixed_gps=fixed_gps,
+                    nmea_gps=nmea_gps,
+                    nmea_max_age_s=getattr(args, "gps_max_age_s", 3.0),
                 )
                 contexts = active_geofence_keys(location, geofences)
                 task = scheduler.acquire_next(now_s=frame.captured_at_s, active_contexts=contexts)
@@ -511,6 +567,9 @@ def run_agent(
                             output_dir=output_dir,
                             outbox=outbox,
                             gps_source_type=args.gps_source_type,
+                            vehicle_id=vehicle_id,
+                            mission_id=mission_id,
+                            route_id=route_id,
                         )
                         events_handle.write(json.dumps(event) + "\n")
                         events_handle.flush()
@@ -521,11 +580,15 @@ def run_agent(
                     health["capture"] = frame_buffer.snapshot()
                     health["scheduler"] = scheduler.snapshot(now_s=now)
                     health["active_geofences"] = sorted(contexts)
+                    if nmea_gps is not None:
+                        health["gps"] = nmea_gps.snapshot()
                     write_json_atomic(output_dir / "device_status.json", health)
                     last_health_sample = now
     finally:
         capture_worker.stop()
         capture_worker.join(timeout=3.0)
+        if nmea_gps is not None:
+            nmea_gps.close()
 
     finished_at = time.monotonic()
     device_health = health_sampler()
@@ -545,6 +608,17 @@ def run_agent(
             "source": args.source,
             "source_fps": round(source_fps, 3),
             "gps_source_type": args.gps_source_type,
+            "vehicle_id": vehicle_id,
+            "mission_id": mission_id,
+            "route_id": route_id,
+            "gps_provider": (
+                "serial_nmea"
+                if nmea_gps is not None
+                else "timestamped_csv"
+                if gps_track is not None
+                else "fixed_demo_coordinate"
+            ),
+            "gps": None if nmea_gps is None else nmea_gps.snapshot(),
             "profile": args.profile,
             "configured_schedules": [schedule_dict(item) for item in schedules],
             "confirmed_events": confirmed_events,
@@ -579,8 +653,15 @@ def default_output_dir() -> str:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--source", default="0", help="Camera index, video path, or RTSP URL")
+    parser.add_argument("--vehicle-id", default="bus-demo-01")
+    parser.add_argument("--mission-id", default="mission-demo")
+    parser.add_argument("--route-id", default="route-unassigned")
     parser.add_argument("--gps-csv", help="Timestamped GPS CSV for route replay or telemetry")
     parser.add_argument("--fixed-gps", help="Fixed demo coordinate as LAT,LON")
+    parser.add_argument("--gps-nmea-device", help="Live serial NMEA source, e.g. /dev/ttyUSB0")
+    parser.add_argument("--gps-baud", type=int, default=9600)
+    parser.add_argument("--gps-fix-timeout-s", type=float, default=15.0)
+    parser.add_argument("--gps-max-age-s", type=float, default=3.0)
     parser.add_argument(
         "--gps-source-type",
         choices=("real_telemetry", "synthetic_demo", "unknown"),
@@ -606,7 +687,9 @@ def parse_args() -> argparse.Namespace:
             gps_csv=args.gps_csv,
             fixed_gps=args.fixed_gps,
             gps_source_type=args.gps_source_type,
+            gps_nmea_device=args.gps_nmea_device,
         )
+        validate_mission_identifiers(args.vehicle_id, args.mission_id, args.route_id)
     except ValueError as exc:
         parser.error(str(exc))
     if args.image_size < 160:
@@ -615,6 +698,8 @@ def parse_args() -> argparse.Namespace:
         parser.error("--duration-s must not be negative")
     if args.health_interval_s <= 0:
         parser.error("--health-interval-s must be positive")
+    if args.gps_baud <= 0 or args.gps_fix_timeout_s <= 0 or args.gps_max_age_s <= 0:
+        parser.error("NMEA GPS baud and timing values must be positive")
     return args
 
 

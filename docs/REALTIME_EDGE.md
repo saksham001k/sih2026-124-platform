@@ -33,15 +33,14 @@ retention responsibility.
 |---|---|---|
 | Traffic objects and persons | Implemented | Always, mixed rate |
 | Road damage | Implemented | Always, mixed rate + 3-of-5 confirmation |
-| Urban assets / waterlogging | Adapter implemented; custom weights required | Low-rate; geofence optimization next |
-| Sign condition | Model not supplied | Cascade from a detected sign crop |
-| Vulnerable pedestrian situation | Rule/model adapter next | School geofence + person track |
-| ANPR | Existing reviewed clip pipeline | Incident-triggered burst adapter next |
+| Urban assets / waterlogging | Executable visual + inventory pipeline; custom weights required | Low-rate/geofenced |
+| Missing asset condition | Inventory-aware absence candidate | No additional model |
+| Vulnerable pedestrian situation | Person/vehicle track conflict + school geofence | No additional model |
+| ANPR | Reviewed event/upload pipeline | Event-triggered or retained clip |
 
-The six capabilities must not run on every camera frame. Sign condition, vulnerable-risk
-classification, and ANPR are cascade or event workloads. The runtime scheduler already
-supports `always`, `geofenced`, and `triggered` activation; this release wires the three
-general detection workloads and preserves explicit gaps for the remaining adapters.
+The six capabilities do not run as six independent models. Inventory, vulnerable-risk,
+motion and incident logic consume detections from the three resident models. ANPR remains
+an event/review workload.
 
 ## Dashcam preflight
 
@@ -58,6 +57,12 @@ HDMI-to-USB capture adapter, a CSI camera, an RTSP URL, or a recorded route repl
 as replay.
 
 ## GPS modes
+
+Live serial NMEA telemetry:
+
+```bash
+--gps-nmea-device /dev/ttyUSB0 --gps-source-type real_telemetry
+```
 
 Timestamped GPS replay or telemetry:
 
@@ -103,8 +108,9 @@ Each mission directory contains:
 - `device_status.json` — refreshable privacy-safe device telemetry
 - `metrics.json` — final capture, scheduler, latency, error, queue and load report
 
-The outbox stores no credentials and performs no transmission by itself. A future HTTPS or
-MQTT adapter must acknowledge a packet before it moves from `pending/` to `sent/`.
+The outbox stores no credentials. `deliver_outbox.py` reads its token from an environment
+variable, retries failures, and moves a packet from `pending/` to `sent/` only after a 2xx
+acknowledgement from `fleet_server.py`.
 
 ## Tuning rule
 
