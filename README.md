@@ -274,24 +274,47 @@ labelled clearly when `gps_source_type` is `synthetic_demo`.
 - Real deployment needs camera calibration, real bus GPS and field validation.
 - Do not estimate vehicle speed in km/h from pixels without calibration and reliable GPS speed.
 
-## Edge model export
+## Edge model export and benchmarking
 
-For Raspberry Pi, NCNN is the primary target. Benchmark on the actual device before making
-performance claims:
+Export and benchmark Ultralytics models for ONNX or NCNN using reproducible warm-up, wall-time
+measurements, artifact hashes and prediction parity. See [edge deployment guide](docs/EDGE_DEPLOYMENT.md).
 
 ```bash
-python optimize_model.py --model yolov8n.pt --format ncnn --source bus.jpg
+python optimize_model.py \
+  --model models/road_hazards.pt \
+  --format onnx \
+  --precision fp32 \
+  --source clips/1.mp4 \
+  --device cpu \
+  --imgsz 640 \
+  --warmup-runs 5 \
+  --benchmark-frames 50 \
+  --confidence 0.25 \
+  --iou 0.70 \
+  --report artifacts/edge_bench/road_hazards_onnx_fp32.json
 ```
 
-INT8 export requires representative calibration data:
+NCNN FP16:
 
 ```bash
 python optimize_model.py \
   --model models/road_hazards.pt \
   --format ncnn \
-  --int8 \
-  --data datasets/road_hazards.yaml
+  --precision fp16 \
+  --source clips/1.mp4 \
+  --device cpu \
+  --report artifacts/edge_bench/road_hazards_ncnn_fp16.json
 ```
+
+INT8 ONNX export requires representative calibration YAML via `--data`. NCNN INT8 is rejected.
+Deprecated `--int8` maps to `--precision int8`.
+
+Reports include measured artifact sizes, SHA-256 hashes, inference and wall-time latency,
+end-to-end FPS, prediction parity and optional validation metrics. Benchmarks from a laptop or
+desktop set `raspberry_pi_benchmarked: false` and must not be presented as Raspberry Pi results.
+Run the same command on the target device before making edge performance claims.
+
+View reports in the dashboard **Edge benchmark** tab.
 
 ## Generated artifacts
 
