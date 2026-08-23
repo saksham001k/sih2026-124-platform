@@ -1,0 +1,24 @@
+# Virtual Environment
+.venv/
+venv/
+env/
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+
+# IDE
+.vscode/
+.idea/
+
+# Datasets (Large files - optional, but good to ignore if they are huge)
+*.h5
+*.pt
+*.pth
+*.zip
+*.tar.gz
+
+# Local configs
+*.local
+.DS_Store
