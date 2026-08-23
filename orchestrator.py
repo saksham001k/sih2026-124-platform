@@ -111,10 +111,34 @@ def merge_or_add_event(
     return True
 
 
-def main() -> None:
-    args = parse_args()
-    if args.frame_skip < 1:
-        raise ValueError("--frame-skip must be at least 1")
+def run_pipeline(
+    *,
+    input_path: Path,
+    gps_path: Path,
+    output_dir: Path,
+    model_path: str,
+    confidence: float = 0.25,
+    frame_skip: int = 3,
+    window_size: int = 5,
+    min_hits: int = 3,
+    dedupe_radius_m: float = 12.0,
+    classes: str = "",
+) -> dict[str, Any]:
+    """Run road perception and return the metrics written to ``output_dir``.
+
+    The importable interface is shared by the CLI and Streamlit demo runner so both
+    execution paths use exactly the same detection and evidence logic.
+    """
+    if frame_skip < 1:
+        raise ValueError("frame_skip must be at least 1")
+    if window_size < 1:
+        raise ValueError("window_size must be at least 1")
+    if min_hits < 1 or min_hits > window_size:
+        raise ValueError("min_hits must be between 1 and window_size")
+    if not 0.0 <= confidence <= 1.0:
+        raise ValueError("confidence must be between 0 and 1")
+    if dedupe_radius_m < 0:
+        raise ValueError("dedupe_radius_m must not be negative")
 
     try:
         import cv2
@@ -122,21 +146,18 @@ def main() -> None:
     except ImportError as exc:
         raise SystemExit("Install dependencies with: pip install -r requirements.txt") from exc
 
-    input_path = Path(args.input)
-    gps_path = Path(args.gps)
     if not input_path.is_file():
-        raise SystemExit(f"Input video not found: {input_path}")
+        raise ValueError(f"Input video not found: {input_path}")
     if not gps_path.is_file():
-        raise SystemExit(f"GPS CSV not found: {gps_path}")
+        raise ValueError(f"GPS CSV not found: {gps_path}")
 
-    output_dir = Path(args.output_dir)
     evidence_dir = output_dir / "evidence"
     evidence_dir.mkdir(parents=True, exist_ok=True)
 
     gps_track = load_gps_csv(gps_path)
-    allowed_classes = {item.strip().lower() for item in args.classes.split(",") if item.strip()}
-    temporal_filter = TemporalEventFilter(args.window_size, args.min_hits)
-    model = YOLO(args.model)
+    allowed_classes = {item.strip().lower() for item in classes.split(",") if item.strip()}
+    temporal_filter = TemporalEventFilter(window_size, min_hits)
+    model = YOLO(model_path)
 
     capture = cv2.VideoCapture(str(input_path))
     if not capture.isOpened():
@@ -171,12 +192,12 @@ def main() -> None:
                 break
 
             annotated = frame
-            if frame_index % args.frame_skip == 0:
+            if frame_index % frame_skip == 0:
                 processed_frames += 1
                 inference_start = time.perf_counter()
                 results = model.track(
                     frame,
-                    conf=args.confidence,
+                    conf=confidence,
                     persist=True,
                     tracker="bytetrack.yaml",
                     verbose=False,
@@ -248,7 +269,7 @@ def main() -> None:
                         "evidence_frame": str(frame_path),
                         "evidence_crop": str(crop_path) if crop.size else "",
                     }
-                    if merge_or_add_event(events, candidate, args.dedupe_radius_m):
+                    if merge_or_add_event(events, candidate, dedupe_radius_m):
                         scale = min(1.0, 960 / annotated.shape[1])
                         context = cv2.resize(
                             annotated,
@@ -286,11 +307,11 @@ def main() -> None:
 
     metrics = {
         "source_video": str(input_path),
-        "model": args.model,
+        "model": model_path,
         "source_frames": frame_index,
         "source_fps": round(source_fps, 3),
         "processed_frames": processed_frames,
-        "frame_skip": args.frame_skip,
+        "frame_skip": frame_skip,
         "detections": len(detections),
         "confirmed_events": len(events),
         "wall_time_s": round(elapsed_s, 3),
@@ -306,8 +327,29 @@ def main() -> None:
     with (output_dir / "metrics.json").open("w", encoding="utf-8") as handle:
         json.dump(metrics, handle, indent=2)
 
+    return metrics
+
+
+def main() -> None:
+    args = parse_args()
+    try:
+        metrics = run_pipeline(
+            input_path=Path(args.input),
+            gps_path=Path(args.gps),
+            output_dir=Path(args.output_dir),
+            model_path=args.model,
+            confidence=args.confidence,
+            frame_skip=args.frame_skip,
+            window_size=args.window_size,
+            min_hits=args.min_hits,
+            dedupe_radius_m=args.dedupe_radius_m,
+            classes=args.classes,
+        )
+    except ValueError as exc:
+        raise SystemExit(str(exc)) from exc
+
     print(json.dumps(metrics, indent=2))
-    print(f"Artifacts written to: {output_dir}")
+    print(f"Artifacts written to: {args.output_dir}")
 
 
 if __name__ == "__main__":

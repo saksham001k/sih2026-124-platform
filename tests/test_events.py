@@ -1,4 +1,6 @@
-from orchestrator import merge_or_add_event
+import pytest
+
+from orchestrator import merge_or_add_event, run_pipeline
 
 
 def event(event_id: str, lat: float, lon: float) -> dict:
@@ -25,3 +27,14 @@ def test_keeps_spatially_distinct_events() -> None:
     added = merge_or_add_event(events, event("two", 28.61, 77.2), 12)
     assert added
     assert len(events) == 2
+
+
+def test_road_pipeline_validates_settings_before_loading_runtime() -> None:
+    with pytest.raises(ValueError, match="frame_skip"):
+        run_pipeline(
+            input_path=None,  # type: ignore[arg-type]
+            gps_path=None,  # type: ignore[arg-type]
+            output_dir=None,  # type: ignore[arg-type]
+            model_path="model.pt",
+            frame_skip=0,
+        )
