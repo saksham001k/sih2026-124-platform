@@ -8,7 +8,6 @@ import json
 import math
 import re
 import time
-import uuid
 from collections import Counter
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -22,6 +21,9 @@ BHARAT_SERIES_PLATE_PATTERN = re.compile(r"^[0-9]{2}BH[0-9]{4}[A-Z]{1,2}$")
 DEFAULT_DETECTOR_MODEL = "yolo-v9-t-384-license-plate-end2end"
 DEFAULT_OCR_MODEL = "cct-xs-v2-global-model"
 DEFAULT_EXECUTION_PROVIDER = "CPUExecutionProvider"
+DEFAULT_CENTER_DISTANCE_THRESHOLD = 1.5
+DEFAULT_AREA_RATIO_MAX = 2.5
+GPS_SOURCE_TYPES = ("synthetic_demo", "real_telemetry", "unknown")
 
 
 class PredictFn(Protocol):
@@ -54,6 +56,17 @@ class PlateTrack:
     @property
     def last_observation(self) -> PlateObservation:
         return self.observations[-1]
+
+
+@dataclass(slots=True)
+class TrackEvidenceCandidate:
+    """Bounded per-track evidence: one best frame/crop pair, not every sampled frame."""
+
+    frame_index: int
+    bbox: tuple[int, int, int, int]
+    rank: tuple[float, float, int]
+    frame_path: Path
+    crop_path: Path
 
 
 def normalize_plate(text: str) -> str:
@@ -100,6 +113,11 @@ def consensus(candidates: list[tuple[str, float]]) -> tuple[str, float, int]:
     return winner, sum(winner_scores) / len(winner_scores), len(winner_scores)
 
 
+def observation_rank(observation: PlateObservation) -> tuple[float, float, int]:
+    """Higher OCR confidence, then detector confidence; prefer earlier frames on ties."""
+    return (observation.ocr_confidence, observation.detector_confidence, -observation.frame_index)
+
+
 def bbox_iou(
     left: tuple[int, int, int, int],
     right: tuple[int, int, int, int],
@@ -123,21 +141,47 @@ def bbox_iou(
     return intersection / union
 
 
-def normalized_center_distance(
+def bbox_diagonal(box: tuple[int, int, int, int]) -> float:
+    width = max(0, box[2] - box[0])
+    height = max(0, box[3] - box[1])
+    return math.hypot(width, height)
+
+
+def bbox_area(box: tuple[int, int, int, int]) -> float:
+    return max(0, box[2] - box[0]) * max(0, box[3] - box[1])
+
+
+def object_relative_center_distance(
     left: tuple[int, int, int, int],
     right: tuple[int, int, int, int],
-    frame_width: int,
-    frame_height: int,
 ) -> float:
+    """Centre distance divided by the larger box diagonal (object-relative)."""
     left_cx = (left[0] + left[2]) / 2
     left_cy = (left[1] + left[3]) / 2
     right_cx = (right[0] + right[2]) / 2
     right_cy = (right[1] + right[3]) / 2
     distance = math.hypot(left_cx - right_cx, left_cy - right_cy)
-    diagonal = math.hypot(frame_width, frame_height)
-    if diagonal <= 0:
+    scale = max(bbox_diagonal(left), bbox_diagonal(right))
+    if scale <= 0:
         return float("inf")
-    return distance / diagonal
+    return distance / scale
+
+
+def bbox_area_ratio(
+    left: tuple[int, int, int, int],
+    right: tuple[int, int, int, int],
+) -> float:
+    left_area = bbox_area(left)
+    right_area = bbox_area(right)
+    smaller = min(left_area, right_area)
+    larger = max(left_area, right_area)
+    if smaller <= 0:
+        return float("inf")
+    return larger / smaller
+
+
+# Backward-compatible alias used by older tests/docs naming.
+normalized_center_distance = object_relative_center_distance
 
 
 @dataclass(slots=True)
@@ -145,54 +189,63 @@ class PlateTracker:
     """Associate sampled plate observations into vehicle-specific tracks."""
 
     iou_threshold: float = 0.30
-    center_distance_threshold: float = 0.08
+    center_distance_threshold: float = DEFAULT_CENTER_DISTANCE_THRESHOLD
+    area_ratio_max: float = DEFAULT_AREA_RATIO_MAX
     track_gap_s: float = 2.0
-    _tracks: list[PlateTrack] = field(default_factory=list, init=False)
+    _active_tracks: list[PlateTrack] = field(default_factory=list, init=False)
+    _completed_tracks: list[PlateTrack] = field(default_factory=list, init=False)
+    _next_track_id: int = field(default=1, init=False)
 
     def __post_init__(self) -> None:
         if not 0.0 <= self.iou_threshold <= 1.0:
             raise ValueError("iou_threshold must be between 0.0 and 1.0")
         if self.center_distance_threshold <= 0:
             raise ValueError("center_distance_threshold must be positive")
+        if self.area_ratio_max <= 0:
+            raise ValueError("area_ratio_max must be positive")
         if self.track_gap_s <= 0:
             raise ValueError("track_gap_s must be positive")
 
+    def _new_track_id(self) -> str:
+        track_id = str(self._next_track_id)
+        self._next_track_id += 1
+        return track_id
+
     def _expire(self, current_time_s: float) -> None:
-        self._tracks = [
-            track
-            for track in self._tracks
-            if current_time_s - track.last_video_time_s <= self.track_gap_s
-        ]
+        still_active: list[PlateTrack] = []
+        for track in self._active_tracks:
+            if current_time_s - track.last_video_time_s <= self.track_gap_s:
+                still_active.append(track)
+            else:
+                self._completed_tracks.append(track)
+        self._active_tracks = still_active
 
     def _match_score(
         self,
         observation: PlateObservation,
         track: PlateTrack,
-        frame_width: int,
-        frame_height: int,
     ) -> tuple[float, float] | None:
         latest = track.last_observation
         overlap = bbox_iou(observation.bbox, latest.bbox)
-        center_distance = normalized_center_distance(
-            observation.bbox,
-            latest.bbox,
-            frame_width,
-            frame_height,
-        )
+        center_distance = object_relative_center_distance(observation.bbox, latest.bbox)
         if overlap >= self.iou_threshold:
             return overlap, center_distance
-        if center_distance <= self.center_distance_threshold:
-            return overlap, center_distance
-        return None
+        if center_distance > self.center_distance_threshold:
+            return None
+        if bbox_area_ratio(observation.bbox, latest.bbox) > self.area_ratio_max:
+            return None
+        return overlap, center_distance
 
     def update(
         self,
         observations: list[PlateObservation],
-        frame_width: int,
-        frame_height: int,
-    ) -> None:
+        frame_width: int = 0,
+        frame_height: int = 0,
+    ) -> list[tuple[PlateTrack, PlateObservation]]:
+        """Associate observations. frame_width/height retained for call-site compatibility."""
+        del frame_width, frame_height
         if not observations:
-            return
+            return []
 
         current_time_s = observations[0].video_time_s
         self._expire(current_time_s)
@@ -203,6 +256,7 @@ class PlateTracker:
         )
         matched_track_ids: set[str] = set()
         matched_observations: list[PlateObservation] = []
+        assignments: list[tuple[PlateTrack, PlateObservation]] = []
 
         for observation in ordered:
             if any(
@@ -213,10 +267,10 @@ class PlateTracker:
 
             best_track: PlateTrack | None = None
             best_score: tuple[float, float] | None = None
-            for track in self._tracks:
+            for track in self._active_tracks:
                 if track.track_id in matched_track_ids:
                     continue
-                score = self._match_score(observation, track, frame_width, frame_height)
+                score = self._match_score(observation, track)
                 if score is None:
                     continue
                 if best_score is None or score[0] > best_score[0] or (
@@ -226,17 +280,72 @@ class PlateTracker:
                     best_score = score
 
             if best_track is None:
-                best_track = PlateTrack(track_id=str(uuid.uuid4()))
-                self._tracks.append(best_track)
+                best_track = PlateTrack(track_id=self._new_track_id())
+                self._active_tracks.append(best_track)
 
             best_track.observations.append(observation)
             best_track.last_video_time_s = observation.video_time_s
             matched_track_ids.add(best_track.track_id)
             matched_observations.append(observation)
+            assignments.append((best_track, observation))
+
+        return assignments
+
+    @property
+    def active_tracks(self) -> list[PlateTrack]:
+        return list(self._active_tracks)
+
+    @property
+    def completed_tracks(self) -> list[PlateTrack]:
+        return list(self._completed_tracks)
+
+    @property
+    def all_tracks(self) -> list[PlateTrack]:
+        return [*self._completed_tracks, *self._active_tracks]
 
     @property
     def tracks(self) -> list[PlateTrack]:
-        return list(self._tracks)
+        """All tracks (completed and active) for event evaluation."""
+        return self.all_tracks
+
+
+def validate_pipeline_settings(
+    *,
+    detector_confidence: float,
+    sample_fps: float,
+    min_observations: int,
+    min_winning_votes: int,
+    min_mean_ocr_confidence: float,
+    iou_threshold: float,
+    center_distance_threshold: float,
+    track_gap_s: float,
+    area_ratio_max: float = DEFAULT_AREA_RATIO_MAX,
+    gps_source_type: str = "synthetic_demo",
+) -> None:
+    if not 0.0 <= detector_confidence <= 1.0:
+        raise ValueError("confidence must be between 0 and 1")
+    if sample_fps <= 0:
+        raise ValueError("sample_fps must be greater than 0")
+    if min_observations < 1:
+        raise ValueError("min_observations must be at least 1")
+    if min_winning_votes < 1:
+        raise ValueError("min_winning_votes must be at least 1")
+    if min_winning_votes > min_observations:
+        raise ValueError("min_winning_votes cannot exceed min_observations")
+    if not 0.0 <= min_mean_ocr_confidence <= 1.0:
+        raise ValueError("min_mean_ocr_confidence must be between 0 and 1")
+    if not 0.0 <= iou_threshold <= 1.0:
+        raise ValueError("iou_threshold must be between 0 and 1")
+    if center_distance_threshold <= 0:
+        raise ValueError("center_distance_threshold must be greater than 0")
+    if track_gap_s <= 0:
+        raise ValueError("track_gap_s must be greater than 0")
+    if area_ratio_max <= 0:
+        raise ValueError("area_ratio_max must be greater than 0")
+    if gps_source_type not in GPS_SOURCE_TYPES:
+        raise ValueError(
+            f"gps_source_type must be one of: {', '.join(GPS_SOURCE_TYPES)}"
+        )
 
 
 def build_confirmed_event(
@@ -259,25 +368,26 @@ def build_confirmed_event(
         return None
     if mean_ocr_confidence < min_mean_ocr_confidence:
         return None
+    if not is_plausible_indian_plate(plate):
+        return None
 
-    best_observation = max(
-        track.observations,
-        key=lambda item: (item.ocr_confidence, item.detector_confidence, -item.frame_index),
-    )
+    best_observation = max(track.observations, key=observation_rank)
     detector_confidences = [item.detector_confidence for item in track.observations]
-    plausible = is_plausible_indian_plate(plate)
-    requires_review = (
-        not plausible
-        or winning_votes < min_winning_votes
-        or mean_ocr_confidence < min_mean_ocr_confidence
+    passes_gate = (
+        len(track.observations) >= min_observations
+        and winning_votes >= min_winning_votes
+        and mean_ocr_confidence >= min_mean_ocr_confidence
+        and is_plausible_indian_plate(plate)
     )
 
     return {
-        "event_id": f"anpr-{track.track_id[:8]}",
+        "event_id": f"anpr-{track.track_id}",
+        "track_id": track.track_id,
         "normalized_plate": plate,
         "masked_plate": mask_plate(plate),
         "first_frame": track.first_observation.frame_index,
         "last_frame": track.last_observation.frame_index,
+        "best_observation_frame": best_observation.frame_index,
         "first_video_time_s": round(track.first_observation.video_time_s, 3),
         "last_video_time_s": round(track.last_observation.video_time_s, 3),
         "observation_count": len(track.observations),
@@ -288,8 +398,9 @@ def build_confirmed_event(
         "bbox": list(best_observation.bbox),
         "latitude": round(best_observation.latitude, 7),
         "longitude": round(best_observation.longitude, 7),
-        "plausible_indian_format": plausible,
-        "requires_human_review": requires_review,
+        "plausible_indian_format": True,
+        "passes_automated_quality_gate": passes_gate,
+        "requires_human_review": True,
         "status": "pending_review",
     }
 
@@ -405,32 +516,87 @@ def write_observations_csv(path: Path, observations: list[PlateObservation]) -> 
             )
 
 
-def save_event_evidence(
-    event: dict[str, object],
-    frame,
-    evidence_dir: Path,
-) -> None:
-    import cv2
-
-    event_id = str(event["event_id"])
-    x1, y1, x2, y2 = map(int, event["bbox"])
-    height, width = frame.shape[:2]
+def _clip_bbox(
+    bbox: tuple[int, int, int, int],
+    width: int,
+    height: int,
+) -> tuple[int, int, int, int]:
+    x1, y1, x2, y2 = bbox
     x1 = max(0, min(x1, width - 1))
     y1 = max(0, min(y1, height - 1))
     x2 = max(x1 + 1, min(x2, width))
     y2 = max(y1 + 1, min(y2, height))
+    return x1, y1, x2, y2
 
-    frame_path = evidence_dir / f"{event_id}-frame.jpg"
-    crop_path = evidence_dir / f"{event_id}-crop.jpg"
+
+def update_track_evidence_candidate(
+    *,
+    track: PlateTrack,
+    observation: PlateObservation,
+    frame,
+    candidates_dir: Path,
+    candidates: dict[str, TrackEvidenceCandidate],
+) -> None:
+    """Keep a single compressed best-observation candidate per track."""
+    import cv2
+
+    rank = observation_rank(observation)
+    existing = candidates.get(track.track_id)
+    if existing is not None and rank <= existing.rank:
+        return
+
+    height, width = frame.shape[:2]
+    x1, y1, x2, y2 = _clip_bbox(observation.bbox, width, height)
+    frame_path = candidates_dir / f"track-{track.track_id}-frame.jpg"
+    crop_path = candidates_dir / f"track-{track.track_id}-crop.jpg"
     cv2.imwrite(str(frame_path), frame, [cv2.IMWRITE_JPEG_QUALITY, 75])
     crop = frame[y1:y2, x1:x2]
-    if crop.size:
+    if getattr(crop, "size", 0):
         cv2.imwrite(str(crop_path), crop, [cv2.IMWRITE_JPEG_QUALITY, 82])
-        event["evidence_frame"] = str(frame_path)
-        event["evidence_crop"] = str(crop_path)
-    else:
-        event["evidence_frame"] = str(frame_path)
+    elif crop_path.exists():
+        crop_path.unlink()
+
+    candidates[track.track_id] = TrackEvidenceCandidate(
+        frame_index=observation.frame_index,
+        bbox=observation.bbox,
+        rank=rank,
+        frame_path=frame_path,
+        crop_path=crop_path,
+    )
+
+
+def promote_track_evidence(
+    event: dict[str, object],
+    candidate: TrackEvidenceCandidate | None,
+    evidence_dir: Path,
+) -> int:
+    """Copy matching best-observation candidate into final evidence paths."""
+    import shutil
+
+    event_id = str(event["event_id"])
+    best_frame = int(event["best_observation_frame"])
+    if candidate is None or candidate.frame_index != best_frame:
+        event["evidence_frame"] = ""
         event["evidence_crop"] = ""
+        return 0
+
+    frame_dest = evidence_dir / f"{event_id}-frame.jpg"
+    crop_dest = evidence_dir / f"{event_id}-crop.jpg"
+    bytes_written = 0
+    if candidate.frame_path.is_file():
+        shutil.copy2(candidate.frame_path, frame_dest)
+        event["evidence_frame"] = str(frame_dest)
+        bytes_written += frame_dest.stat().st_size
+    else:
+        event["evidence_frame"] = ""
+
+    if candidate.crop_path.is_file():
+        shutil.copy2(candidate.crop_path, crop_dest)
+        event["evidence_crop"] = str(crop_dest)
+        bytes_written += crop_dest.stat().st_size
+    else:
+        event["evidence_crop"] = ""
+    return bytes_written
 
 
 def run_pipeline(
@@ -449,8 +615,26 @@ def run_pipeline(
     track_gap_s: float,
     show_plate_text: bool,
     gps_label: str,
+    gps_source_type: str = "synthetic_demo",
+    detector_model: str = DEFAULT_DETECTOR_MODEL,
+    ocr_model: str = DEFAULT_OCR_MODEL,
+    execution_provider: str = DEFAULT_EXECUTION_PROVIDER,
+    area_ratio_max: float = DEFAULT_AREA_RATIO_MAX,
 ) -> dict[str, object]:
     import cv2
+
+    validate_pipeline_settings(
+        detector_confidence=detector_confidence,
+        sample_fps=sample_fps,
+        min_observations=min_observations,
+        min_winning_votes=min_winning_votes,
+        min_mean_ocr_confidence=min_mean_ocr_confidence,
+        iou_threshold=iou_threshold,
+        center_distance_threshold=center_distance_threshold,
+        track_gap_s=track_gap_s,
+        area_ratio_max=area_ratio_max,
+        gps_source_type=gps_source_type,
+    )
 
     capture = cv2.VideoCapture(str(input_path))
     if not capture.isOpened():
@@ -460,23 +644,27 @@ def run_pipeline(
     frame_width = int(capture.get(cv2.CAP_PROP_FRAME_WIDTH))
     frame_height = int(capture.get(cv2.CAP_PROP_FRAME_HEIGHT))
     sample_interval = max(1, round(source_fps / sample_fps))
+    actual_sampled_fps = source_fps / sample_interval
     gps_track = load_gps_csv(gps_path)
     tracker = PlateTracker(
         iou_threshold=iou_threshold,
         center_distance_threshold=center_distance_threshold,
+        area_ratio_max=area_ratio_max,
         track_gap_s=track_gap_s,
     )
 
     output_dir.mkdir(parents=True, exist_ok=True)
     evidence_dir = output_dir / "evidence"
     evidence_dir.mkdir(parents=True, exist_ok=True)
+    candidates_dir = output_dir / ".candidates"
+    candidates_dir.mkdir(parents=True, exist_ok=True)
 
     all_observations: list[PlateObservation] = []
+    evidence_candidates: dict[str, TrackEvidenceCandidate] = {}
     sampled_frames = 0
     total_detections = 0
     ocr_results = 0
     frame_index = 0
-    evidence_frames: dict[int, object] = {}
     start = time.perf_counter()
 
     try:
@@ -496,15 +684,24 @@ def run_pipeline(
                 )
                 total_detections += len(observations)
                 ocr_results += sum(1 for item in observations if item.normalized_plate)
-                tracker.update(observations, frame_width, frame_height)
+                assignments = tracker.update(observations, frame_width, frame_height)
                 all_observations.extend(observations)
-                evidence_frames[frame_index] = frame.copy()
+                for track, observation in assignments:
+                    update_track_evidence_candidate(
+                        track=track,
+                        observation=observation,
+                        frame=frame,
+                        candidates_dir=candidates_dir,
+                        candidates=evidence_candidates,
+                    )
             frame_index += 1
     finally:
         capture.release()
 
+    source_frames = frame_index
     confirmed_events: list[dict[str, object]] = []
-    for track in tracker.tracks:
+    evidence_bytes = 0
+    for track in tracker.all_tracks:
         event = build_confirmed_event(
             track,
             min_observations=min_observations,
@@ -514,19 +711,27 @@ def run_pipeline(
         if event is None:
             continue
         track.confirmed = True
-        evidence_frame = evidence_frames.get(int(event["last_frame"]))
-        if evidence_frame is not None:
-            save_event_evidence(event, evidence_frame, evidence_dir)
+        candidate = evidence_candidates.get(track.track_id)
+        evidence_bytes += promote_track_evidence(event, candidate, evidence_dir)
         confirmed_events.append(event)
+
+    # Temporary candidates are never referenced for unconfirmed tracks.
+    for path in candidates_dir.glob("*"):
+        if path.is_file():
+            path.unlink()
+    if candidates_dir.is_dir():
+        candidates_dir.rmdir()
 
     elapsed_s = time.perf_counter() - start
     metrics = {
         "source_video": str(input_path),
-        "gps_source": gps_label,
-        "gps_is_synthetic_demo": gps_label.endswith("gps_data.csv"),
-        "detector_confidence_threshold": detector_confidence,
-        "sample_fps_requested": sample_fps,
+        "detector_model": detector_model,
+        "ocr_model": ocr_model,
+        "execution_provider": execution_provider,
+        "source_frames": source_frames,
         "source_fps": round(source_fps, 3),
+        "requested_sample_fps": sample_fps,
+        "actual_sampled_fps": round(actual_sampled_fps, 3),
         "sample_interval_frames": sample_interval,
         "sampled_frames": sampled_frames,
         "total_detections": total_detections,
@@ -534,6 +739,10 @@ def run_pipeline(
         "confirmed_tracks": len(confirmed_events),
         "wall_time_s": round(elapsed_s, 3),
         "sampled_inference_fps": round(sampled_frames / elapsed_s, 3) if elapsed_s else 0.0,
+        "gps_source": gps_label,
+        "gps_source_type": gps_source_type,
+        "evidence_bytes": evidence_bytes,
+        "detector_confidence_threshold": detector_confidence,
     }
 
     write_observations_csv(output_dir / "anpr_observations.csv", all_observations)
@@ -551,10 +760,10 @@ def run_pipeline(
                 int(item["observation_count"]),
             ),
         )
-        (output_dir / "anpr_result.json").write_text(
-            json.dumps(strongest_event, indent=2),
-            encoding="utf-8",
-        )
+    (output_dir / "anpr_result.json").write_text(
+        json.dumps(strongest_event, indent=2),
+        encoding="utf-8",
+    )
     (output_dir / "metrics.json").write_text(json.dumps(metrics, indent=2), encoding="utf-8")
 
     console_events = confirmed_events
@@ -580,6 +789,12 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--input", required=True, help="Incident video clip")
     parser.add_argument("--gps", default="gps_data.csv", help="Timestamped GPS CSV")
+    parser.add_argument(
+        "--gps-source-type",
+        choices=GPS_SOURCE_TYPES,
+        default="synthetic_demo",
+        help="Explicit GPS provenance label (never inferred from filename)",
+    )
     parser.add_argument("--output-dir", default="artifacts/anpr")
     parser.add_argument("--detector-model", default=DEFAULT_DETECTOR_MODEL)
     parser.add_argument("--ocr-model", default=DEFAULT_OCR_MODEL)
@@ -590,7 +805,21 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--min-winning-votes", type=int, default=2)
     parser.add_argument("--min-mean-ocr-confidence", type=float, default=0.80)
     parser.add_argument("--iou-threshold", type=float, default=0.30)
-    parser.add_argument("--center-distance-threshold", type=float, default=0.08)
+    parser.add_argument(
+        "--center-distance-threshold",
+        type=float,
+        default=DEFAULT_CENTER_DISTANCE_THRESHOLD,
+        help=(
+            "Object-relative centre-distance limit "
+            "(distance / max box diagonal); default 1.5"
+        ),
+    )
+    parser.add_argument(
+        "--area-ratio-max",
+        type=float,
+        default=DEFAULT_AREA_RATIO_MAX,
+        help="Max box area ratio allowed for centre-distance fallback matching",
+    )
     parser.add_argument("--track-gap-s", type=float, default=2.0)
     parser.add_argument(
         "--show-plate-text",
@@ -608,6 +837,22 @@ def main() -> None:
         raise SystemExit(f"Incident clip not found: {input_path}")
     if not gps_path.is_file():
         raise SystemExit(f"GPS CSV not found: {gps_path}")
+
+    try:
+        validate_pipeline_settings(
+            detector_confidence=args.confidence,
+            sample_fps=args.sample_fps,
+            min_observations=args.min_observations,
+            min_winning_votes=args.min_winning_votes,
+            min_mean_ocr_confidence=args.min_mean_ocr_confidence,
+            iou_threshold=args.iou_threshold,
+            center_distance_threshold=args.center_distance_threshold,
+            track_gap_s=args.track_gap_s,
+            area_ratio_max=args.area_ratio_max,
+            gps_source_type=args.gps_source_type,
+        )
+    except ValueError as exc:
+        raise SystemExit(str(exc)) from exc
 
     predict_fn = create_alpr_engine(
         detector_model=args.detector_model,
@@ -630,6 +875,11 @@ def main() -> None:
         track_gap_s=args.track_gap_s,
         show_plate_text=args.show_plate_text,
         gps_label=str(gps_path),
+        gps_source_type=args.gps_source_type,
+        detector_model=args.detector_model,
+        ocr_model=args.ocr_model,
+        execution_provider=args.execution_provider,
+        area_ratio_max=args.area_ratio_max,
     )
     print(json.dumps(result, indent=2))
 

@@ -175,30 +175,39 @@ and must not be committed to Git.
 python anpr_pipeline.py \
   --input incident_clip.mp4 \
   --gps gps_data.csv \
+  --gps-source-type synthetic_demo \
   --confidence 0.20 \
   --sample-fps 5 \
   --output-dir artifacts/anpr
 ```
 
 Use `--show-plate-text` only for local debugging. Default console output masks plate text.
+Set `--gps-source-type` explicitly to `synthetic_demo`, `real_telemetry`, or `unknown` —
+GPS provenance is never inferred from the filename.
 
 ### Outputs
 
 The selected artifact directory receives:
 
 - `anpr_observations.csv` — every sampled plate observation with masked console-safe fields
-- `anpr_events.json` — confirmed multi-frame plate tracks
-- `anpr_result.json` — strongest confirmed event for backward compatibility
-- `metrics.json` — model names, provider, sampled frames, detections and timing
-- `evidence/` — reviewable context frame and crop per confirmed event
+- `anpr_events.json` — multi-frame plate tracks that pass the automated quality gate
+- `anpr_result.json` — strongest confirmed event, or JSON `null` when none exist
+- `metrics.json` — model names, provider, GPS source type, sampled frames, detections and timing
+- `evidence/` — reviewable context frame and crop from the best observation per confirmed event
+
+Every emitted event sets `requires_human_review: true` and `status: "pending_review"`.
+`passes_automated_quality_gate` is `true` only when observation count, winning OCR votes,
+mean OCR confidence and Indian/Bharat format checks all pass. Invalid-format OCR never
+becomes a confirmed event (raw observations may still appear in the CSV).
 
 ### Validation limitations
 
 - Functional smoke testing on a local clip is **not** an accuracy percentage.
 - FastALPR region/country prediction is ignored for acceptance because it can be unstable on
   Indian footage.
-- The bundled `gps_data.csv` is synthetic demo data, not real bus telemetry.
-- Confirmed events still require human review before any enforcement action.
+- Label GPS with `--gps-source-type`; the bundled `gps_data.csv` is synthetic demo data, not
+  real bus telemetry.
+- This pipeline never attributes enforcement automatically — human review is always required.
 
 ### Privacy policy
 
