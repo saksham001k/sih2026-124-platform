@@ -7,6 +7,18 @@
 3. **Intelligence:** temporal confirmation and spatial deduplication produce events.
 4. **Command:** compact evidence packets are reviewed on a GIS dashboard.
 
+## Live edge scheduling
+
+The live path uses one camera capture thread and one inference worker. The capture thread
+writes to a small bounded buffer. The worker consumes the newest frame and deliberately
+drops stale analysis frames rather than allowing alert latency to grow. Each capability
+has its own target rate and activation mode (`always`, `geofenced`, or `triggered`).
+
+Model file size is not used as a proxy for runtime cost. Per-model mean/max latency,
+attempts, failures, device memory, temperature, and dropped-frame counts travel in the
+mission report. The dashboard remains on the command laptop; the edge device does not
+render the 3D scene.
+
 ## Event lifecycle
 
 ```mermaid

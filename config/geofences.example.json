@@ -1,0 +1,14 @@
+[
+  {
+    "key": "school-zone-demo",
+    "latitude": 28.6139,
+    "longitude": 77.209,
+    "radius_m": 150
+  },
+  {
+    "key": "expected-crossing-demo",
+    "latitude": 28.6125,
+    "longitude": 77.211,
+    "radius_m": 60
+  }
+]

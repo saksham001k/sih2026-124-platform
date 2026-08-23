@@ -28,6 +28,11 @@ Also measure additional confirmation latency introduced by the filter.
 - End-to-end FPS, CPU/RAM and temperature
 - Source and exported model size
 - Accuracy change after INT8 quantization
+- Captured camera FPS versus analytics attempts per second
+- Stale frames deliberately dropped by the bounded edge buffer
+- Per-capability target rate, achieved attempts, failures and mean/max latency
+- Estimated single-worker utilization from measured latency, clearly labelled as an estimate
+- Thermal throttling and offline-queue recovery during a continuous field run
 
 ## ANPR
 

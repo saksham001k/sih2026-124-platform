@@ -786,6 +786,104 @@ def render_edge_benchmark_section(report_path: Path) -> None:
         st.json(report)
 
 
+def render_live_edge_section(mission_dir: Path) -> None:
+    """Render privacy-safe status emitted by ``edge_agent.py``."""
+    st.subheader("Live edge mission")
+    st.caption(
+        "Capture and analytics are measured separately. The dashcam may capture at 30 FPS "
+        "while mixed-rate edge models analyze selected fresh frames without building a backlog."
+    )
+    status = load_json(str(mission_dir / "device_status.json"))
+    report = load_json(str(mission_dir / "metrics.json"))
+    if not isinstance(status, dict) or not status:
+        st.info(
+            "No live edge status found. Start the agent on a Raspberry Pi or use a recorded "
+            "route replay, then point the sidebar to its mission directory."
+        )
+        st.code(
+            "python edge_agent.py --source 0 --fixed-gps 28.6139,77.2090 "
+            "--gps-source-type synthetic_demo --profile pi4 "
+            "--output-dir artifacts/edge_live/latest",
+            language="bash",
+        )
+        return
+
+    capture = status.get("capture", {})
+    schedules = status.get("scheduler", {}).get("schedules", {})
+    temperature = status.get("cpu_temperature_c")
+    available_memory = status.get("memory_available_mb")
+    device_name = status.get("device_model") or (
+        f"{status.get('platform', 'Unknown')} · {status.get('machine', 'unknown')}"
+    )
+    pi_label = "RASPBERRY PI VERIFIED" if status.get("raspberry_pi") else "NON-PI RUNTIME"
+    mission_status = str(status.get("mission_status", "running")).replace("_", " ").upper()
+
+    st.markdown(
+        "<div class='mission-card'>"
+        f"<div class='eyebrow'><span class='live-dot'></span>{escape(mission_status)}</div>"
+        f"<div style='font-size:1.25rem;font-weight:720;margin:.3rem 0'>"
+        f"{escape(str(device_name))}</div>"
+        f"<div class='muted'>{escape(pi_label)} · privacy-safe device telemetry</div>"
+        "</div>",
+        unsafe_allow_html=True,
+    )
+
+    captured = int(capture.get("captured_frames", 0))
+    dropped = int(capture.get("dropped_analysis_frames", 0))
+    drop_rate = dropped / captured * 100 if captured else 0.0
+    analytics_attempts = int(report.get("analytics_attempts", 0)) if report else sum(
+        int(values.get("attempted", 0)) for values in schedules.values()
+    )
+    columns = st.columns(6)
+    columns[0].metric("Captured frames", captured)
+    columns[1].metric("Analytics runs", analytics_attempts)
+    columns[2].metric("Dropped for freshness", dropped, f"{drop_rate:.1f}%")
+    columns[3].metric(
+        "CPU temperature",
+        "Unavailable" if temperature is None else f"{float(temperature):.1f} °C",
+    )
+    columns[4].metric(
+        "Available memory",
+        "Unavailable" if available_memory is None else f"{float(available_memory):.0f} MB",
+    )
+    columns[5].metric("Evidence queued", int(report.get("pending_evidence_packets", 0)))
+
+    if schedules:
+        rows = []
+        for name, values in schedules.items():
+            rows.append(
+                {
+                    "Capability": str(name).replace("_", " ").title(),
+                    "Activation": values.get("activation", "unknown"),
+                    "Target FPS": values.get("target_fps", 0),
+                    "Attempts": values.get("attempted", 0),
+                    "Succeeded": values.get("succeeded", 0),
+                    "Mean latency (ms)": values.get("mean_latency_ms", 0),
+                    "Max latency (ms)": values.get("max_latency_ms", 0),
+                    "Last error": values.get("last_error", ""),
+                }
+            )
+        st.dataframe(pd.DataFrame(rows), hide_index=True, use_container_width=True)
+
+    budget = report.get("compute_budget", {}) if isinstance(report, dict) else {}
+    if budget:
+        utilization = float(budget.get("estimated_utilization", 0))
+        if budget.get("overloaded"):
+            st.error(
+                f"Measured schedule demand is {utilization * 100:.1f}% of one inference "
+                "worker. Reduce model rates or resolution before field deployment."
+            )
+        else:
+            st.success(
+                f"Measured schedule demand is {utilization * 100:.1f}% of one inference "
+                "worker. This is a device-specific measurement, not a general Pi claim."
+            )
+    if status.get("active_geofences"):
+        st.write("Active geofences:", ", ".join(status["active_geofences"]))
+    with st.expander("Privacy-safe device status JSON"):
+        st.json(status)
+
+
 def render_anpr_section(artifacts_dir: Path, stage: dict[str, Any] | None = None) -> None:
     events_value = load_json(str(artifacts_dir / "anpr_events.json"))
     metrics = load_json(str(artifacts_dir / "metrics.json"))
@@ -1236,13 +1334,17 @@ def main() -> None:
             "Edge benchmark report",
             "artifacts/edge_bench/road_hazards_onnx_fp32.json",
         )
+        live_edge_value = st.text_input(
+            "Live edge mission",
+            "artifacts/edge_live/latest",
+        )
     if st.sidebar.button("Refresh data", use_container_width=True):
         st.cache_data.clear()
         st.rerun()
 
     edge_report_path = Path(edge_report_value)
 
-    scan_tab, command_tab, road_tab, traffic_tab, anpr_tab, edge_tab = st.tabs(
+    scan_tab, command_tab, road_tab, traffic_tab, anpr_tab, edge_tab, live_edge_tab = st.tabs(
         [
             "New scan",
             "3D command centre",
@@ -1250,6 +1352,7 @@ def main() -> None:
             "Traffic analytics",
             "ANPR review",
             "Edge benchmark",
+            "Live edge",
         ]
     )
     with scan_tab:
@@ -1302,6 +1405,8 @@ def main() -> None:
         render_anpr_section(anpr_dir, stage)
     with edge_tab:
         render_edge_benchmark_section(edge_report_path)
+    with live_edge_tab:
+        render_live_edge_section(Path(live_edge_value))
 
 
 if __name__ == "__main__":
